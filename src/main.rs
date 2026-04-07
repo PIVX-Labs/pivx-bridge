@@ -55,6 +55,11 @@ async fn main() {
     let cache_path = "shield.bin".to_string();
     let mut shield_index = index::load_or_create(&index_path);
 
+    // Crash recovery: truncate shield.bin to last complete block footer
+    if let Some(last_good_height) = cache::recover_cache(&cache_path) {
+        eprintln!("  Cache recovered — last complete block: {last_good_height}");
+    }
+
     // Open (or create) the binary cache
     let mut cache_file = cache::open_cache(&cache_path)
         .expect("failed to open shield.bin");
