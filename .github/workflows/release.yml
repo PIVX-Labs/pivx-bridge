@@ -9,52 +9,41 @@ env:
 
 jobs:
   build-linux:
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            name: pivx-bridge-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            name: pivx-bridge-linux-aarch64
-
     runs-on: ubuntu-latest
-    container: ubuntu:20.04
+    container:
+      image: ubuntu:20.04
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        HOME: /root
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y curl build-essential pkg-config
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            apt-get install -y gcc-aarch64-linux-gnu
-          fi
+          apt-get install -y curl build-essential pkg-config cmake g++
 
       - name: Install Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "/root/.cargo/bin" >> $GITHUB_PATH
 
       - name: Build
         run: |
-          . "$HOME/.cargo/env"
-          cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          . "/root/.cargo/env"
+          cargo build --release --target x86_64-unknown-linux-gnu
 
       - name: Package
         run: |
-          cp target/${{ matrix.target }}/release/pivx-bridge ${{ matrix.name }}
-          chmod +x ${{ matrix.name }}
+          cp target/x86_64-unknown-linux-gnu/release/pivx-bridge pivx-bridge-linux-x86_64
+          chmod +x pivx-bridge-linux-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          name: pivx-bridge-linux-x86_64
+          path: pivx-bridge-linux-x86_64
 
   build-macos:
     strategy:
