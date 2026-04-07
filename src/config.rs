@@ -43,6 +43,10 @@ pub struct Config {
     /// Sapling activation height (mainnet)
     #[arg(long, env = "SAPLING_HEIGHT", default_value_t = 2_700_501)]
     pub sapling_height: u32,
+
+    /// Disable gzip compression (use when behind nginx or another compressing proxy)
+    #[arg(long, env = "NO_COMPRESSION")]
+    pub no_compression: bool,
 }
 
 impl Config {

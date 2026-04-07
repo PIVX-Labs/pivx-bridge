@@ -17,70 +17,63 @@ use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
 use tokio::sync::{Mutex, RwLock};
-use tower_http::compression::CompressionLayer;
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tower_http::cors::CorsLayer;
 
-#[tokio::main]
-async fn main() {
-    // Load .env if present
-    let _ = dotenvy::dotenv();
+/// Network initialization parameters.
+struct NetworkConfig<'a> {
+    label: &'a str,
+    rpc_url: &'a str,
+    rpc_user: &'a str,
+    rpc_pass: &'a str,
+    index_path: &'a str,
+    cache_path: &'a str,
+    sapling_height: u32,
+    allowed_rpcs: Vec<String>,
+}
 
-    let config = config::Config::parse();
+/// Initialize a network: connect to node, scan blocks, build state.
+fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
+    let label = cfg.label;
+    eprintln!("\n  [{label}] Connecting to {}...", cfg.rpc_url);
 
-    eprintln!("╔══════════════════════════════════════════╗");
-    eprintln!("║          PIVX Bridge v{}           ║", env!("CARGO_PKG_VERSION"));
-    eprintln!("╠══════════════════════════════════════════╣");
-    eprintln!("║  RPC:  {}  ", config.rpc_url);
-    eprintln!("║  ZMQ:  {}  ", config.zmq_url);
-    eprintln!("║  Port: {}                            ", config.port);
-    eprintln!("╚══════════════════════════════════════════╝");
-
-    // Connect to PIVX node
-    let rpc = rpc::RpcClient::new(&config.rpc_url, &config.rpc_user, &config.rpc_pass);
+    let rpc = rpc::RpcClient::new(cfg.rpc_url, cfg.rpc_user, cfg.rpc_pass);
 
     let chain_height = match rpc.get_block_count() {
         Ok(h) => {
-            eprintln!("  Connected to PIVX node — chain height: {h}");
+            eprintln!("  [{label}] Connected — chain height: {h}");
             h as u32
         }
         Err(e) => {
-            eprintln!("  ERROR: Cannot connect to PIVX node: {e}");
-            eprintln!("  Make sure the node is running with server=1 in pivx.conf");
-            std::process::exit(1);
+            eprintln!("  [{label}] Cannot connect: {e}");
+            return None;
         }
     };
 
-    // Load shield index
-    let index_path = "shield_index.json".to_string();
-    let cache_path = "shield.bin".to_string();
-    let mut shield_index = index::load_or_create(&index_path);
+    let mut shield_index = index::load_or_create(cfg.index_path);
 
-    // Crash recovery: truncate shield.bin to last complete block footer
-    if let Some(last_good_height) = cache::recover_cache(&cache_path) {
-        eprintln!("  Cache recovered — last complete block: {last_good_height}");
+    if let Some(last_good) = cache::recover_cache(cfg.cache_path) {
+        eprintln!("  [{label}] Cache recovered — last complete block: {last_good}");
     }
 
-    // Open (or create) the binary cache
-    let mut cache_file = cache::open_cache(&cache_path)
-        .expect("failed to open shield.bin");
+    let mut cache_file = cache::open_cache(cfg.cache_path)
+        .expect("failed to open cache file");
 
-    // Initial scan
     let scan_from = shield_index
         .last_height()
         .map(|h| h + 1)
-        .unwrap_or(config.sapling_height);
+        .unwrap_or(cfg.sapling_height);
 
     if scan_from <= chain_height {
-        eprintln!("  Scanning blocks {scan_from}..{chain_height} for Sapling transactions...");
+        eprintln!("  [{label}] Scanning blocks {scan_from}..{chain_height}...");
 
         match scanner::scan_range(&rpc, scan_from, chain_height, |done, total| {
             if total > 0 && (done % 100 == 0 || done == total) {
-                eprint!("\r  Progress: {done}/{total} blocks");
+                eprint!("\r  [{label}] Progress: {done}/{total} blocks");
             }
         }) {
             Ok(blocks) => {
                 let count = blocks.len();
-                // Write to cache and update index
                 match cache::append_blocks(&mut cache_file, &blocks) {
                     Ok(entries) => {
                         for (height, offset, _len) in entries {
@@ -88,54 +81,68 @@ async fn main() {
                         }
                     }
                     Err(e) => {
-                        eprintln!("\n  Warning: failed to write cache: {e}");
-                        // Fall back to index-only (no cache)
+                        eprintln!("\n  [{label}] Warning: cache write failed: {e}");
                         for block in &blocks {
                             shield_index.add(block.height, 0);
                         }
                     }
                 }
-                if let Err(e) = shield_index.save(&index_path) {
-                    eprintln!("\n  Warning: failed to save index: {e}");
+                if let Err(e) = shield_index.save(cfg.index_path) {
+                    eprintln!("\n  [{label}] Warning: index save failed: {e}");
                 }
-                eprintln!("\n  Found {count} shield blocks ({} total indexed)",
+                eprintln!("\n  [{label}] Found {count} shield blocks ({} total)",
                     shield_index.shield_heights.len());
             }
             Err(e) => {
-                eprintln!("\n  Scan error: {e} — continuing with partial index");
+                eprintln!("\n  [{label}] Scan error: {e}");
             }
         }
     } else {
-        eprintln!("  Index up to date — {} shield blocks indexed",
+        eprintln!("  [{label}] Up to date — {} shield blocks",
             shield_index.shield_heights.len());
     }
 
-    // Build shared state
-    let state = Arc::new(api::AppState {
-        rpc: rpc::RpcClient::new(&config.rpc_url, &config.rpc_user, &config.rpc_pass),
+    Some(Arc::new(api::AppState {
+        rpc: rpc::RpcClient::new(cfg.rpc_url, cfg.rpc_user, cfg.rpc_pass),
         index: RwLock::new(shield_index),
-        cache_path: cache_path.clone(),
+        cache_path: cfg.cache_path.to_string(),
         cache_file: Mutex::new(cache_file),
-        allowed_rpcs: config.allowed_rpc_set(),
-    });
+        allowed_rpcs: cfg.allowed_rpcs.clone(),
+    }))
+}
 
-    // ZMQ background subscriber
-    let zmq_state = state.clone();
-    let zmq_url = config.zmq_url.clone();
-    let zmq_rpc_url = config.rpc_url.clone();
-    let zmq_rpc_user = config.rpc_user.clone();
-    let zmq_rpc_pass = config.rpc_pass.clone();
+/// Build the standard route set for a network.
+fn build_routes(state: Arc<api::AppState>) -> Router {
+    Router::new()
+        .route("/getshielddata", get(api::get_shield_data))
+        .route("/getshielddatalength", get(api::get_shield_data_length))
+        .route("/getblockcount", get(api::get_block_count))
+        .route("/getshieldblocks", get(api::get_shield_blocks))
+        .route("/sendrawtransaction", post(api::send_raw_transaction))
+        .route("/{method}", get(proxy::rpc_proxy))
+        .with_state(state)
+}
 
+/// Spawn ZMQ background subscriber for live block indexing.
+fn spawn_zmq_subscriber(
+    label: &'static str,
+    zmq_url: String,
+    rpc_url: String,
+    rpc_user: String,
+    rpc_pass: String,
+    state: Arc<api::AppState>,
+    index_path: String,
+) {
     tokio::spawn(async move {
-        eprintln!("  [zmq] Subscribing to {zmq_url}...");
+        eprintln!("  [{label}] ZMQ subscribing to {zmq_url}...");
 
         let mut subscriber = match bitcoincore_zmq::subscribe_async(&[&zmq_url]) {
             Ok(s) => {
-                eprintln!("  [zmq] Connected — listening for new blocks");
+                eprintln!("  [{label}] ZMQ connected");
                 s
             }
             Err(e) => {
-                eprintln!("  [zmq] Failed to subscribe: {e} — no live updates");
+                eprintln!("  [{label}] ZMQ failed: {e}");
                 return;
             }
         };
@@ -145,7 +152,7 @@ async fn main() {
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("  [zmq] Stream error: {e}");
+                    eprintln!("  [{label}] ZMQ error: {e}");
                     continue;
                 }
             };
@@ -154,12 +161,10 @@ async fn main() {
                 continue;
             }
 
-            eprintln!("  [zmq] New block notification");
-
-            let bg_rpc_url = zmq_rpc_url.clone();
-            let bg_rpc_user = zmq_rpc_user.clone();
-            let bg_rpc_pass = zmq_rpc_pass.clone();
-            let bg_state = zmq_state.clone();
+            let bg_rpc_url = rpc_url.clone();
+            let bg_rpc_user = rpc_user.clone();
+            let bg_rpc_pass = rpc_pass.clone();
+            let bg_state = state.clone();
             let bg_index_path = index_path.clone();
 
             tokio::task::spawn_blocking(move || {
@@ -168,7 +173,7 @@ async fn main() {
                 let chain_height = match rpc.get_block_count() {
                     Ok(h) => h as u32,
                     Err(e) => {
-                        eprintln!("  [zmq] RPC error: {e}");
+                        eprintln!("  [{label}] ZMQ RPC error: {e}");
                         return;
                     }
                 };
@@ -188,7 +193,6 @@ async fn main() {
                         let count = blocks.len();
                         let rt = tokio::runtime::Handle::current();
                         rt.block_on(async {
-                            // Write to cache
                             let cache_entries = {
                                 let mut file = bg_state.cache_file.lock().await;
                                 cache::append_blocks(&mut file, &blocks).ok()
@@ -205,47 +209,109 @@ async fn main() {
                                 }
                             }
                             if let Err(e) = index.save(&bg_index_path) {
-                                eprintln!("  [zmq] Failed to save index: {e}");
+                                eprintln!("  [{label}] Index save failed: {e}");
                             }
                         });
                         if count > 0 {
-                            eprintln!("  [zmq] Indexed {count} new shield block(s)");
+                            eprintln!("  [{label}] Indexed {count} new shield block(s)");
                         }
                     }
                     Err(e) => {
-                        eprintln!("  [zmq] Scan error: {e}");
+                        eprintln!("  [{label}] Scan error: {e}");
                     }
                 }
             }).await.ok();
         }
     });
+}
 
-    // Build router
-    let mainnet_routes = Router::new()
-        .route("/getshielddata", get(api::get_shield_data))
-        .route("/getshielddatalength", get(api::get_shield_data_length))
-        .route("/getblockcount", get(api::get_block_count))
-        .route("/getshieldblocks", get(api::get_shield_blocks))
-        .route("/sendrawtransaction", post(api::send_raw_transaction))
-        .route("/{method}", get(proxy::rpc_proxy));
+#[tokio::main]
+async fn main() {
+    let _ = dotenvy::dotenv();
+    let config = config::Config::parse();
 
-    // Serve with /mainnet/ prefix and also without prefix for direct access
-    let app = Router::new()
+    eprintln!("╔══════════════════════════════════════════╗");
+    eprintln!("║          PIVX Bridge v{}           ║", env!("CARGO_PKG_VERSION"));
+    eprintln!("╠══════════════════════════════════════════╣");
+    eprintln!("║  RPC:  {}  ", config.rpc_url);
+    eprintln!("║  ZMQ:  {}  ", config.zmq_url);
+    eprintln!("║  Port: {}                            ", config.port);
+    eprintln!("╚══════════════════════════════════════════╝");
+
+    let allowed_rpcs = config.allowed_rpc_set();
+
+    // -- Mainnet --
+    let mainnet_state = init_network(&NetworkConfig {
+        label: "mainnet",
+        rpc_url: &config.rpc_url,
+        rpc_user: &config.rpc_user,
+        rpc_pass: &config.rpc_pass,
+        index_path: "shield_index.json",
+        cache_path: "shield.bin",
+        sapling_height: config.sapling_height,
+        allowed_rpcs: allowed_rpcs.clone(),
+    }).expect("mainnet initialization failed");
+
+    let mainnet_index_path = "shield_index.json".to_string();
+    spawn_zmq_subscriber(
+        "mainnet",
+        config.zmq_url.clone(),
+        config.rpc_url.clone(), config.rpc_user.clone(), config.rpc_pass.clone(),
+        mainnet_state.clone(),
+        mainnet_index_path,
+    );
+
+    let mainnet_routes = build_routes(mainnet_state);
+
+    // -- Router --
+    let mut app = Router::new()
         .nest("/mainnet", mainnet_routes.clone())
-        .merge(mainnet_routes)
-        .with_state(state)
-        .layer(CorsLayer::permissive())
-        .layer(CompressionLayer::new());
+        .merge(mainnet_routes);
+
+    // -- Testnet (optional) --
+    if let Some(testnet_url) = &config.testnet_rpc_url {
+        let testnet_user = config.testnet_rpc_user.as_deref().unwrap_or(&config.rpc_user);
+        let testnet_pass = config.testnet_rpc_pass.as_deref().unwrap_or(&config.rpc_pass);
+
+        if let Some(testnet_state) = init_network(&NetworkConfig {
+            label: "testnet",
+            rpc_url: testnet_url,
+            rpc_user: testnet_user,
+            rpc_pass: testnet_pass,
+            index_path: "shield_index.testnet.json",
+            cache_path: "shield.testnet.bin",
+            sapling_height: config.sapling_height,
+            allowed_rpcs,
+        }) {
+            let testnet_index_path = "shield_index.testnet.json".to_string();
+            spawn_zmq_subscriber(
+                "testnet",
+                config.zmq_url.clone(),
+                testnet_url.clone(), testnet_user.to_string(), testnet_pass.to_string(),
+                testnet_state.clone(),
+                testnet_index_path,
+            );
+
+            let testnet_routes = build_routes(testnet_state);
+            app = app.nest("/testnet", testnet_routes);
+            eprintln!("  Testnet: enabled at /testnet/");
+        }
+    }
+
+    // -- Layers --
+    let app = app.layer(CorsLayer::permissive());
+
+    let app = if config.no_compression {
+        eprintln!("  Compression: OFF");
+        app.into_make_service()
+    } else {
+        eprintln!("  Compression: ON (gzip, best quality — disable with --no-compression)");
+        app.layer(CompressionLayer::new().quality(CompressionLevel::Best))
+            .into_make_service()
+    };
 
     let addr = format!("0.0.0.0:{}", config.port);
     eprintln!("\n  Listening on http://{addr}");
-    eprintln!("  Routes:");
-    eprintln!("    GET  /mainnet/getshielddata?startBlock=N&format=pivx|compact|compactplus");
-    eprintln!("    GET  /mainnet/getshielddatalength?startBlock=N&endBlock=M");
-    eprintln!("    GET  /mainnet/getblockcount");
-    eprintln!("    GET  /mainnet/getshieldblocks");
-    eprintln!("    POST /mainnet/sendrawtransaction");
-    eprintln!("    GET  /mainnet/:rpc?params=...&filter=...");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
