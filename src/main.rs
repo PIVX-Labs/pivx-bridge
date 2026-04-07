@@ -3,8 +3,10 @@
 /// Connects to a PIVX full node, scans for Sapling transactions, and serves
 /// shield data to light wallets (MyPIVXWallet) over HTTP.
 mod api;
+mod cache;
 mod config;
 mod index;
+mod proxy;
 mod rpc;
 mod scanner;
 mod stream;
@@ -14,7 +16,9 @@ use std::sync::Arc;
 use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tower_http::compression::CompressionLayer;
+use tower_http::cors::CorsLayer;
 
 #[tokio::main]
 async fn main() {
@@ -48,7 +52,12 @@ async fn main() {
 
     // Load shield index
     let index_path = "shield_index.json".to_string();
+    let cache_path = "shield.bin".to_string();
     let mut shield_index = index::load_or_create(&index_path);
+
+    // Open (or create) the binary cache
+    let mut cache_file = cache::open_cache(&cache_path)
+        .expect("failed to open shield.bin");
 
     // Initial scan
     let scan_from = shield_index
@@ -66,8 +75,20 @@ async fn main() {
         }) {
             Ok(blocks) => {
                 let count = blocks.len();
-                for block in &blocks {
-                    shield_index.add(block.height, 0);
+                // Write to cache and update index
+                match cache::append_blocks(&mut cache_file, &blocks) {
+                    Ok(entries) => {
+                        for (height, offset, _len) in entries {
+                            shield_index.add(height, offset);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\n  Warning: failed to write cache: {e}");
+                        // Fall back to index-only (no cache)
+                        for block in &blocks {
+                            shield_index.add(block.height, 0);
+                        }
+                    }
                 }
                 if let Err(e) = shield_index.save(&index_path) {
                     eprintln!("\n  Warning: failed to save index: {e}");
@@ -89,6 +110,9 @@ async fn main() {
         rpc: rpc::RpcClient::new(&config.rpc_url, &config.rpc_user, &config.rpc_pass),
         index: RwLock::new(shield_index),
         index_path: index_path.clone(),
+        cache_path: cache_path.clone(),
+        cache_file: Mutex::new(cache_file),
+        allowed_rpcs: config.allowed_rpc_set(),
     });
 
     // ZMQ background subscriber
@@ -160,9 +184,21 @@ async fn main() {
                         let count = blocks.len();
                         let rt = tokio::runtime::Handle::current();
                         rt.block_on(async {
+                            // Write to cache
+                            let cache_entries = {
+                                let mut file = bg_state.cache_file.lock().await;
+                                cache::append_blocks(&mut file, &blocks).ok()
+                            };
+
                             let mut index = bg_state.index.write().await;
-                            for block in &blocks {
-                                index.add(block.height, 0);
+                            if let Some(entries) = cache_entries {
+                                for (height, offset, _len) in entries {
+                                    index.add(height, offset);
+                                }
+                            } else {
+                                for block in &blocks {
+                                    index.add(block.height, 0);
+                                }
                             }
                             if let Err(e) = index.save(&bg_index_path) {
                                 eprintln!("  [zmq] Failed to save index: {e}");
@@ -180,23 +216,32 @@ async fn main() {
         }
     });
 
-    // Build router with /mainnet/ prefix (PivxNodeController compat)
+    // Build router
     let mainnet_routes = Router::new()
         .route("/getshielddata", get(api::get_shield_data))
+        .route("/getshielddatalength", get(api::get_shield_data_length))
         .route("/getblockcount", get(api::get_block_count))
         .route("/getshieldblocks", get(api::get_shield_blocks))
-        .route("/sendrawtransaction", post(api::send_raw_transaction));
+        .route("/sendrawtransaction", post(api::send_raw_transaction))
+        .route("/{method}", get(proxy::rpc_proxy));
 
-    // Also serve without prefix for direct access
+    // Serve with /mainnet/ prefix and also without prefix for direct access
     let app = Router::new()
         .nest("/mainnet", mainnet_routes.clone())
         .merge(mainnet_routes)
-        .with_state(state);
+        .with_state(state)
+        .layer(CorsLayer::permissive())
+        .layer(CompressionLayer::new());
 
     let addr = format!("0.0.0.0:{}", config.port);
     eprintln!("\n  Listening on http://{addr}");
-    eprintln!("  Routes: /mainnet/getshielddata, /mainnet/getblockcount, /mainnet/getshieldblocks");
-    eprintln!("          /mainnet/sendrawtransaction");
+    eprintln!("  Routes:");
+    eprintln!("    GET  /mainnet/getshielddata?startBlock=N&format=pivx|compact|compactplus");
+    eprintln!("    GET  /mainnet/getshielddatalength?startBlock=N&endBlock=M");
+    eprintln!("    GET  /mainnet/getblockcount");
+    eprintln!("    GET  /mainnet/getshieldblocks");
+    eprintln!("    POST /mainnet/sendrawtransaction");
+    eprintln!("    GET  /mainnet/:rpc?params=...&filter=...");
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

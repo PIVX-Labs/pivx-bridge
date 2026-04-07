@@ -49,13 +49,14 @@ pub fn encode_shield_stream(blocks: &[ShieldBlock], format: StreamFormat) -> Vec
     stream
 }
 
-/// PIVX-compatible encoding: 0x03 full tx packets, then 0x5d block footer with time.
+/// PIVX-compatible encoding: raw tx bytes (naturally start with 0x03), then 0x5d block footer.
+///
+/// PivxNodeController writes raw tx bytes directly — the version byte (0x03) IS the
+/// implicit type marker. There is NO separate type prefix byte.
 fn encode_pivx_compat(stream: &mut Vec<u8>, block: &ShieldBlock) {
-    // Transactions first (0x03 packets)
+    // Transactions first (raw bytes, no type prefix — 0x03 is the tx version byte)
     for tx in &block.txs {
-        let payload_len = 1 + tx.raw.len();
-        stream.extend((payload_len as u32).to_le_bytes());
-        stream.push(PACKET_TYPE_FULL_TX);
+        stream.extend((tx.raw.len() as u32).to_le_bytes());
         stream.extend_from_slice(&tx.raw);
     }
 
@@ -159,8 +160,8 @@ pub fn pivx_compat_stream_size(blocks: &[ShieldBlock]) -> u64 {
     let mut size: u64 = 0;
     for block in blocks {
         for tx in &block.txs {
-            // Length prefix (4) + type byte (1) + raw tx bytes
-            size += 4 + 1 + tx.raw.len() as u64;
+            // Length prefix (4) + raw tx bytes (no type prefix)
+            size += 4 + tx.raw.len() as u64;
         }
         // Block footer: length prefix (4) + 9-byte payload
         size += 4 + 9;

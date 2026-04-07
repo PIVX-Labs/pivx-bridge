@@ -4,12 +4,13 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
+use crate::cache;
 use crate::index::ShieldIndex;
 use crate::rpc::RpcClient;
 use crate::scanner;
@@ -20,6 +21,9 @@ pub struct AppState {
     pub rpc: RpcClient,
     pub index: RwLock<ShieldIndex>,
     pub index_path: String,
+    pub cache_path: String,
+    pub cache_file: Mutex<std::fs::File>,
+    pub allowed_rpcs: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,31 +58,64 @@ pub struct ShieldDataQuery {
     pub format: StreamFormat,
 }
 
+/// Build a binary response with X-Content-Length header (PivxNodeController compat).
+fn build_binary_response(data: Vec<u8>) -> Response {
+    let len = data.len();
+    let mut resp = Response::new(axum::body::Body::from(data));
+    resp.headers_mut().insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
+    resp.headers_mut().insert("X-Content-Length", HeaderValue::from(len as u64));
+    resp
+}
+
 /// Serve shield data as a binary stream.
+///
+/// For the default PIVX-compat format, serves from the shield.bin cache.
+/// For compact formats, re-fetches from the node and encodes on-the-fly.
 pub async fn get_shield_data(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ShieldDataQuery>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     let start = query.start_block.unwrap_or(0);
     let format = query.format;
     eprintln!("  [shielddata] Request startBlock={start} format={format:?}");
 
-    // Get shield block heights from the index
+    // For PIVX-compat format, serve from cache file
+    if format == StreamFormat::PivxCompat {
+        let (offset, total_size) = {
+            let index = state.index.read().await;
+            let offset = index.offset_for_height(start).unwrap_or(0);
+            let total = cache::cache_size(&state.cache_path);
+            (offset, total)
+        };
+
+        if offset >= total_size {
+            return Ok(build_binary_response(Vec::new()));
+        }
+
+        let cache_path = state.cache_path.clone();
+        let data = tokio::task::spawn_blocking(move || {
+            let mut file = cache::open_cache(&cache_path)
+                .map_err(|e| format!("cache open: {e}"))?;
+            cache::read_from(&mut file, offset)
+                .map_err(|e| format!("cache read: {e}"))
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        return Ok(build_binary_response(data));
+    }
+
+    // For compact formats, fetch from node and encode on-the-fly
     let heights = {
         let index = state.index.read().await;
         index.heights_from(start)
     };
-    eprintln!("  [shielddata] {} shield blocks to serve", heights.len());
 
     if heights.is_empty() {
-        return Ok((
-            StatusCode::OK,
-            [("Content-Type", "application/octet-stream")],
-            Vec::new(),
-        ));
+        return Ok(build_binary_response(Vec::new()));
     }
 
-    // Fetch and encode blocks (blocking RPC calls in spawn_blocking)
     let rpc_url = state.rpc.url().to_string();
     let rpc_user = state.rpc.user().to_string();
     let rpc_pass = state.rpc.pass().to_string();
@@ -86,7 +123,6 @@ pub async fn get_shield_data(
     let data = tokio::task::spawn_blocking(move || {
         let rpc = RpcClient::new(&rpc_url, &rpc_user, &rpc_pass);
         let mut blocks = Vec::new();
-
         for height in heights {
             match scanner::scan_block(&rpc, height) {
                 Ok(Some(block)) => blocks.push(block),
@@ -94,18 +130,44 @@ pub async fn get_shield_data(
                 Err(e) => return Err(format!("scan error at height {height}: {e}")),
             }
         }
-
         Ok(stream::encode_shield_stream(&blocks, format))
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task error: {e}")))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok((
-        StatusCode::OK,
-        [("Content-Type", "application/octet-stream")],
-        data,
-    ))
+    Ok(build_binary_response(data))
+}
+
+// ---------------------------------------------------------------------------
+// GET /mainnet/getshielddatalength?startBlock=N&endBlock=M
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ShieldDataLengthQuery {
+    #[serde(rename = "startBlock")]
+    pub start_block: Option<u32>,
+    #[serde(rename = "endBlock")]
+    pub end_block: Option<u32>,
+}
+
+/// Return the byte count of shield data between two block heights.
+///
+/// Used by MPW for sync progress bars.
+pub async fn get_shield_data_length(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ShieldDataLengthQuery>,
+) -> Result<String, (StatusCode, String)> {
+    let start = query.start_block.unwrap_or(0);
+    let end = query.end_block.unwrap_or(u32::MAX);
+    let total_cache = cache::cache_size(&state.cache_path);
+
+    let length = {
+        let index = state.index.read().await;
+        index.byte_length_between(start, end, total_cache)
+    };
+
+    Ok(length.to_string())
 }
 
 // ---------------------------------------------------------------------------

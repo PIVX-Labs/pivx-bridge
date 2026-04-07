@@ -67,6 +67,29 @@ impl ShieldIndex {
     pub fn last_height(&self) -> Option<u32> {
         self.shield_heights.last().copied()
     }
+
+    /// Get the byte offset for a given start block.
+    ///
+    /// Returns the offset of the first entry with height >= start_block,
+    /// or the end of the file if no entries match.
+    pub fn offset_for_height(&self, height: u32) -> Option<u64> {
+        self.entries.iter()
+            .find(|e| e.block >= height)
+            .map(|e| e.i)
+    }
+
+    /// Compute the total byte length of shield data between two block heights.
+    ///
+    /// Used by `getshielddatalength` to report progress without materializing the stream.
+    pub fn byte_length_between(&self, start: u32, end: u32, total_cache_size: u64) -> u64 {
+        let start_offset = self.offset_for_height(start).unwrap_or(total_cache_size);
+        // Find the first entry AFTER end block
+        let end_offset = self.entries.iter()
+            .find(|e| e.block > end)
+            .map(|e| e.i)
+            .unwrap_or(total_cache_size);
+        end_offset.saturating_sub(start_offset)
+    }
 }
 
 /// Load index from file, or create empty if it doesn't exist.
