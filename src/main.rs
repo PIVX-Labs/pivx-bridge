@@ -135,32 +135,39 @@ fn spawn_zmq_subscriber(
     index_path: String,
 ) {
     tokio::spawn(async move {
-        eprintln!("  [{label}] ZMQ subscribing to {zmq_url}...");
-
-        let mut subscriber = match bitcoincore_zmq::subscribe_async(&[&zmq_url]) {
-            Ok(s) => {
-                eprintln!("  [{label}] ZMQ connected");
-                s
-            }
-            Err(e) => {
-                eprintln!("  [{label}] ZMQ failed: {e}");
-                return;
-            }
-        };
-
         use futures::StreamExt;
-        while let Some(msg) = subscriber.next().await {
-            let msg = match msg {
-                Ok(m) => m,
+
+        // Outer loop: reconnect on failure
+        loop {
+            eprintln!("  [{label}] ZMQ subscribing to {zmq_url}...");
+
+            let mut subscriber = match bitcoincore_zmq::subscribe_async(&[&zmq_url]) {
+                Ok(s) => {
+                    eprintln!("  [{label}] ZMQ connected");
+                    s
+                }
                 Err(e) => {
-                    eprintln!("  [{label}] ZMQ error: {e}");
+                    eprintln!("  [{label}] ZMQ failed: {e} — retrying in 10s");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     continue;
                 }
             };
 
-            if !matches!(msg, bitcoincore_zmq::Message::HashBlock(_, _)) {
-                continue;
-            }
+            // Inner loop: process messages until disconnection
+            let mut disconnected = false;
+            while let Some(msg) = subscriber.next().await {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("  [{label}] ZMQ error: {e} — reconnecting");
+                        disconnected = true;
+                        break;
+                    }
+                };
+
+                if !matches!(msg, bitcoincore_zmq::Message::HashBlock(_, _)) {
+                    continue;
+                }
 
             let bg_rpc_url = rpc_url.clone();
             let bg_rpc_user = rpc_user.clone();
@@ -222,7 +229,13 @@ fn spawn_zmq_subscriber(
                     }
                 }
             }).await.ok();
-        }
+            } // end inner while
+
+            if disconnected {
+                eprintln!("  [{label}] ZMQ reconnecting in 5s...");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        } // end outer loop
     });
 }
 

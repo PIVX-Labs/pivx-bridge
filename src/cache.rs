@@ -11,26 +11,21 @@ use crate::scanner::ShieldBlock;
 use crate::stream;
 use crate::api::StreamFormat;
 
-/// Append a shield block to the binary cache file in PIVX-compat format.
-///
-/// Returns the byte offset where this block's data starts and its length.
-pub fn append_block(file: &mut File, block: &ShieldBlock) -> std::io::Result<(u64, u64)> {
-    let offset = file.seek(SeekFrom::End(0))?;
-    let encoded = stream::encode_shield_stream(std::slice::from_ref(block), StreamFormat::PivxCompat);
-    file.write_all(&encoded)?;
-    file.flush()?;
-    Ok((offset, encoded.len() as u64))
-}
-
-/// Append multiple shield blocks to the cache file.
+/// Append multiple shield blocks to the cache file with a single flush.
 ///
 /// Returns a vec of (height, byte_offset, byte_length) for each block.
 pub fn append_blocks(file: &mut File, blocks: &[ShieldBlock]) -> std::io::Result<Vec<(u32, u64, u64)>> {
-    let mut entries = Vec::new();
+    let mut current_offset = file.seek(SeekFrom::End(0))?;
+    let mut entries = Vec::with_capacity(blocks.len());
+
     for block in blocks {
-        let (offset, len) = append_block(file, block)?;
-        entries.push((block.height, offset, len));
+        let encoded = stream::encode_shield_stream(std::slice::from_ref(block), StreamFormat::PivxCompat);
+        file.write_all(&encoded)?;
+        entries.push((block.height, current_offset, encoded.len() as u64));
+        current_offset += encoded.len() as u64;
     }
+
+    file.flush()?; // single flush for entire batch
     Ok(entries)
 }
 
@@ -135,12 +130,14 @@ mod tests {
 
         let mut file = open_cache(path).unwrap();
         let block = make_block(100, 1000);
-        let (offset, len) = append_block(&mut file, &block).unwrap();
-        assert_eq!(offset, 0);
-        assert!(len > 0);
+        let entries = append_blocks(&mut file, &[block]).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 100); // height
+        assert_eq!(entries[0].1, 0);   // offset
+        assert!(entries[0].2 > 0);     // length
 
         let data = read_from(&mut file, 0).unwrap();
-        assert_eq!(data.len(), len as usize);
+        assert_eq!(data.len(), entries[0].2 as usize);
 
         fs::remove_file(path).ok();
     }

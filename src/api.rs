@@ -230,6 +230,12 @@ pub async fn send_raw_transaction(
     body: String,
 ) -> Result<String, (StatusCode, String)> {
     let hex = body.trim();
+    if hex.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty transaction hex".into()));
+    }
+    if hex.len() > 10_000_000 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "transaction too large".into()));
+    }
     eprintln!("  [broadcast] Received tx hex ({} bytes)", hex.len());
 
     match state.rpc.send_raw_transaction(hex) {

@@ -16,6 +16,7 @@ impl RpcClient {
             pass: pass.to_string(),
             agent: ureq::AgentBuilder::new()
                 .max_idle_connections(4)
+                .timeout(std::time::Duration::from_secs(30))
                 .build(),
         }
     }

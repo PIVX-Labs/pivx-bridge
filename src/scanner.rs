@@ -88,20 +88,23 @@ fn scan_block_inner(
     let mut txs = Vec::new();
 
     for txid_val in txids {
-        let txid = txid_val
-            .as_str()
-            .ok_or(ScanError::Parse("txid not a string".into()))?;
-
-        // Fetch raw transaction hex
-        let raw_hex = match rpc.get_raw_transaction(txid, false) {
-            Ok(val) => match val.as_str() {
-                Some(s) => s.to_string(),
-                None => continue,
-            },
-            Err(e) => {
-                eprintln!("  Warning: getrawtransaction({txid}): {e} — skipping");
-                continue;
+        // Verbosity 2: tx is an object with "hex" field inline
+        // Verbosity 1: tx is a txid string, need separate getrawtransaction
+        let raw_hex = if let Some(hex) = txid_val.get("hex").and_then(|h| h.as_str()) {
+            hex.to_string()
+        } else if let Some(txid) = txid_val.as_str() {
+            match rpc.get_raw_transaction(txid, false) {
+                Ok(val) => match val.as_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                },
+                Err(e) => {
+                    eprintln!("  Warning: getrawtransaction({txid}): {e} — skipping");
+                    continue;
+                }
             }
+        } else {
+            continue;
         };
 
         let tx_bytes = match hex_decode(&raw_hex) {
@@ -129,8 +132,9 @@ pub fn scan_block(rpc: &RpcClient, height: u32) -> Result<Option<ShieldBlock>, S
         .get_block_hash(height)
         .map_err(|e| ScanError::Rpc(format!("getblockhash({height}): {e}")))?;
 
+    // Verbosity 2: includes full tx hex inline (no separate getrawtransaction needed)
     let block_json = rpc
-        .get_block(&hash, 1)
+        .get_block(&hash, 2)
         .map_err(|e| ScanError::Rpc(format!("getblock({hash}): {e}")))?;
 
     let h = block_json
@@ -160,7 +164,7 @@ pub fn scan_range(
     for height in start..=end {
         on_progress(height - start, total);
 
-        let block_json = match rpc.get_block(&current_hash, 1) {
+        let block_json = match rpc.get_block(&current_hash, 2) {
             Ok(json) => json,
             Err(e) => {
                 eprintln!("\n  Warning: block {height} ({current_hash}): {e} — skipping");

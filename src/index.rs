@@ -58,9 +58,10 @@ impl ShieldIndex {
         }
     }
 
-    /// Get all shield block heights from a starting height.
+    /// Get all shield block heights from a starting height (binary search).
     pub fn heights_from(&self, start: u32) -> Vec<u32> {
-        self.shield_heights.iter().copied().filter(|&h| h >= start).collect()
+        let idx = self.shield_heights.partition_point(|&h| h < start);
+        self.shield_heights[idx..].to_vec()
     }
 
     /// Last indexed height, if any.
@@ -73,9 +74,8 @@ impl ShieldIndex {
     /// Returns the offset of the first entry with height >= start_block,
     /// or the end of the file if no entries match.
     pub fn offset_for_height(&self, height: u32) -> Option<u64> {
-        self.entries.iter()
-            .find(|e| e.block >= height)
-            .map(|e| e.i)
+        let idx = self.entries.partition_point(|e| e.block < height);
+        self.entries.get(idx).map(|e| e.i)
     }
 
     /// Compute the total byte length of shield data between two block heights.
