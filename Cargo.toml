@@ -1,0 +1,30 @@
+[package]
+name = "pivx-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "PIVX shield sync bridge — drop-in replacement for PivxNodeController, written in Rust"
+license = "MIT"
+
+[dependencies]
+# HTTP server
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
+
+# RPC client (blocking — used in spawn_blocking)
+ureq = { version = "2", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI + env
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+
+# ZMQ block notifications
+bitcoincore-zmq = { version = "1.5", features = ["async"] }
+futures = "0.3"
+
+# Utilities
+sha2 = "0.10"

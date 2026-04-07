@@ -1,0 +1,4 @@
+/target
+.env
+shield.bin
+shield_index.json

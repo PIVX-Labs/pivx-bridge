@@ -1,0 +1,52 @@
+/// CLI configuration — command-line args with env var fallbacks.
+use clap::Parser;
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "pivx-bridge", about = "PIVX shield sync bridge")]
+pub struct Config {
+    /// PIVX node RPC URL
+    #[arg(long, env = "RPC_URL", default_value = "http://127.0.0.1:51473")]
+    pub rpc_url: String,
+
+    /// RPC username
+    #[arg(long, env = "RPC_USER", default_value = "rpc")]
+    pub rpc_user: String,
+
+    /// RPC password
+    #[arg(long, env = "RPC_PASS", default_value = "rpc")]
+    pub rpc_pass: String,
+
+    /// Testnet RPC URL (enables /testnet/ routes)
+    #[arg(long, env = "TESTNET_RPC_URL")]
+    pub testnet_rpc_url: Option<String>,
+
+    /// Testnet RPC username
+    #[arg(long, env = "TESTNET_RPC_USER")]
+    pub testnet_rpc_user: Option<String>,
+
+    /// Testnet RPC password
+    #[arg(long, env = "TESTNET_RPC_PASS")]
+    pub testnet_rpc_pass: Option<String>,
+
+    /// ZMQ endpoint for hashblock notifications
+    #[arg(long, env = "ZMQ_URL", default_value = "tcp://127.0.0.1:28332")]
+    pub zmq_url: String,
+
+    /// HTTP server port
+    #[arg(long, env = "PORT", default_value_t = 3000)]
+    pub port: u16,
+
+    /// Comma-separated list of allowed RPC methods for the proxy
+    #[arg(long, env = "ALLOWED_RPCS", default_value = "getblockcount,getblockhash,getblock,getrawtransaction,sendrawtransaction,getmasternodecount,listmasternodes,getbudgetprojection,getbudgetinfo,getbudgetvotes")]
+    pub allowed_rpcs: String,
+
+    /// Sapling activation height (mainnet)
+    #[arg(long, env = "SAPLING_HEIGHT", default_value_t = 2_700_501)]
+    pub sapling_height: u32,
+}
+
+impl Config {
+    pub fn allowed_rpc_set(&self) -> Vec<String> {
+        self.allowed_rpcs.split(',').map(|s| s.trim().to_string()).collect()
+    }
+}
