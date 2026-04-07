@@ -200,6 +200,30 @@ pub async fn get_shield_blocks(
 // POST /mainnet/sendrawtransaction (body = hex string)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// GET /mainnet/address_index
+// ---------------------------------------------------------------------------
+
+/// Serve the address index SQLite file (used by MPW-Tauri for bootstrap).
+pub async fn get_address_index() -> Result<Response, (StatusCode, String)> {
+    let path = "address_index.sqlite";
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("address index not available: {e}")))?;
+
+    let mut resp = Response::new(axum::body::Body::from(data));
+    resp.headers_mut().insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
+    resp.headers_mut().insert(
+        "Content-Disposition",
+        HeaderValue::from_static("attachment; filename=\"address_index.sqlite\""),
+    );
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// POST /mainnet/sendrawtransaction (body = hex string)
+// ---------------------------------------------------------------------------
+
 /// Broadcast a raw transaction to the network.
 pub async fn send_raw_transaction(
     State(state): State<Arc<AppState>>,

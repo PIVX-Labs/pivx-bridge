@@ -119,6 +119,7 @@ fn build_routes(state: Arc<api::AppState>) -> Router {
         .route("/getblockcount", get(api::get_block_count))
         .route("/getshieldblocks", get(api::get_shield_blocks))
         .route("/sendrawtransaction", post(api::send_raw_transaction))
+        .route("/address_index", get(api::get_address_index))
         .route("/{method}", get(proxy::rpc_proxy))
         .with_state(state)
 }

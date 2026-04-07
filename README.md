@@ -15,7 +15,7 @@ PivxNodeController is written in Node.js. PIVX Bridge replaces it with a single 
 - **Starts faster** — scans the full chain in a fraction of the time
 - **Uses less memory** — no V8 heap, no garbage collector
 - **Responds instantly** — serves from a pre-built binary cache on disk
-- **Stays current** — ZMQ block notifications instead of 60-second polling
+- **Stays current** — ZMQ block notifications instead of 60-second polling (PivxNodeController can delay shield tx visibility by up to a full block)
 - **Saves bandwidth** — opt-in compact formats cut sync data by 24-42%
 
 ## Quick Start
