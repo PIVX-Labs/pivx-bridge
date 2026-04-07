@@ -24,18 +24,13 @@ jobs:
           apt-get update
           apt-get install -y curl build-essential pkg-config cmake g++
 
-      - name: Install Rust
+      - name: Install Rust and build
+        shell: bash
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "/root/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Build
-        run: |
-          . "/root/.cargo/env"
+          source /root/.cargo/env
+          rustc --version
           cargo build --release --target x86_64-unknown-linux-gnu
-
-      - name: Package
-        run: |
           cp target/x86_64-unknown-linux-gnu/release/pivx-bridge pivx-bridge-linux-x86_64
           chmod +x pivx-bridge-linux-x86_64
 
