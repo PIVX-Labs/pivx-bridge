@@ -5,7 +5,6 @@
 /// from the node on every request.
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
 
 use crate::scanner::ShieldBlock;
 use crate::stream;
@@ -66,14 +65,3 @@ pub fn cache_size(path: &str) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Truncate the cache file to a specific offset (for reorg handling).
-pub fn truncate_cache(path: &str, offset: u64) -> std::io::Result<()> {
-    let file = OpenOptions::new().write(true).open(path)?;
-    file.set_len(offset)?;
-    Ok(())
-}
-
-/// Check if a cache file exists and is non-empty.
-pub fn cache_exists(path: &str) -> bool {
-    Path::new(path).exists() && cache_size(path) > 0
-}

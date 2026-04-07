@@ -109,7 +109,6 @@ async fn main() {
     let state = Arc::new(api::AppState {
         rpc: rpc::RpcClient::new(&config.rpc_url, &config.rpc_user, &config.rpc_pass),
         index: RwLock::new(shield_index),
-        index_path: index_path.clone(),
         cache_path: cache_path.clone(),
         cache_file: Mutex::new(cache_file),
         allowed_rpcs: config.allowed_rpc_set(),

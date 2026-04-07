@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
@@ -20,7 +20,6 @@ use crate::stream;
 pub struct AppState {
     pub rpc: RpcClient,
     pub index: RwLock<ShieldIndex>,
-    pub index_path: String,
     pub cache_path: String,
     pub cache_file: Mutex<std::fs::File>,
     pub allowed_rpcs: Vec<String>,

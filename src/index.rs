@@ -92,6 +92,112 @@ impl ShieldIndex {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_index_is_empty() {
+        let idx = ShieldIndex::new();
+        assert!(idx.entries.is_empty());
+        assert!(idx.shield_heights.is_empty());
+        assert_eq!(idx.last_height(), None);
+    }
+
+    #[test]
+    fn add_block_tracks_height_and_offset() {
+        let mut idx = ShieldIndex::new();
+        idx.add(2700501, 0);
+        idx.add(2700510, 1234);
+        assert_eq!(idx.shield_heights, vec![2700501, 2700510]);
+        assert_eq!(idx.entries[0].block, 2700501);
+        assert_eq!(idx.entries[0].i, 0);
+        assert_eq!(idx.entries[1].i, 1234);
+    }
+
+    #[test]
+    fn add_duplicate_height_ignored() {
+        let mut idx = ShieldIndex::new();
+        idx.add(100, 0);
+        idx.add(100, 999);
+        assert_eq!(idx.shield_heights.len(), 1);
+        assert_eq!(idx.entries[0].i, 0); // first one wins
+    }
+
+    #[test]
+    fn heights_from_filters_correctly() {
+        let mut idx = ShieldIndex::new();
+        for h in [100, 200, 300, 400, 500] {
+            idx.add(h, 0);
+        }
+        assert_eq!(idx.heights_from(250), vec![300, 400, 500]);
+        assert_eq!(idx.heights_from(100), vec![100, 200, 300, 400, 500]);
+        assert_eq!(idx.heights_from(600), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn offset_for_height() {
+        let mut idx = ShieldIndex::new();
+        idx.add(100, 0);
+        idx.add(200, 500);
+        idx.add(300, 1200);
+
+        assert_eq!(idx.offset_for_height(100), Some(0));
+        assert_eq!(idx.offset_for_height(200), Some(500));
+        assert_eq!(idx.offset_for_height(150), Some(500)); // next >= 150
+        assert_eq!(idx.offset_for_height(400), None);
+    }
+
+    #[test]
+    fn byte_length_between() {
+        let mut idx = ShieldIndex::new();
+        idx.add(100, 0);
+        idx.add(200, 500);
+        idx.add(300, 1200);
+
+        let total = 2000u64;
+        // From block 100 to 200: offset 0 to first block > 200 (300 at offset 1200)
+        assert_eq!(idx.byte_length_between(100, 200, total), 1200);
+        // From block 200 to 300: offset 500 to end (no block > 300)
+        assert_eq!(idx.byte_length_between(200, 300, total), 1500);
+        // From block 100 to 300: full file
+        assert_eq!(idx.byte_length_between(100, 300, total), 2000);
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let mut idx = ShieldIndex::new();
+        idx.add(2700501, 0);
+        idx.add(2700510, 5000);
+
+        let path = "/tmp/pivx_bridge_test_index.json";
+        idx.save(path).unwrap();
+        let loaded = ShieldIndex::load(path).unwrap();
+
+        assert_eq!(loaded.shield_heights, vec![2700501, 2700510]);
+        assert_eq!(loaded.entries[0].block, 2700501);
+        assert_eq!(loaded.entries[1].i, 5000);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn json_format_matches_pivx_node_controller() {
+        let mut idx = ShieldIndex::new();
+        idx.add(2700501, 0);
+        idx.add(2700510, 1234);
+
+        let json = serde_json::to_string(&idx.entries).unwrap();
+        // PivxNodeController format: [{block: N, i: M}, ...]
+        assert!(json.contains("\"block\":2700501"));
+        assert!(json.contains("\"i\":1234"));
+
+        // Verify it parses back
+        let parsed: Vec<IndexEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+}
+
 /// Load index from file, or create empty if it doesn't exist.
 pub fn load_or_create(path: &str) -> ShieldIndex {
     if Path::new(path).exists() {

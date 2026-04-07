@@ -354,3 +354,85 @@ impl std::fmt::Display for ScanError {
 }
 
 impl std::error::Error for ScanError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_valid() {
+        assert_eq!(hex_decode("deadbeef"), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(hex_decode("0300"), Some(vec![0x03, 0x00]));
+        assert_eq!(hex_decode(""), Some(vec![]));
+    }
+
+    #[test]
+    fn hex_decode_odd_length() {
+        assert_eq!(hex_decode("abc"), None);
+    }
+
+    #[test]
+    fn hex_decode_invalid_chars() {
+        assert_eq!(hex_decode("gg"), None);
+    }
+
+    #[test]
+    fn read_compact_size_single_byte() {
+        let data = [42u8];
+        let (val, consumed) = read_compact_size(&data, 0).unwrap();
+        assert_eq!(val, 42);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn read_compact_size_two_byte() {
+        let data = [253u8, 0x00, 0x01]; // 256
+        let (val, consumed) = read_compact_size(&data, 0).unwrap();
+        assert_eq!(val, 256);
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn read_compact_size_four_byte() {
+        let data = [254u8, 0x01, 0x00, 0x01, 0x00]; // 65537
+        let (val, consumed) = read_compact_size(&data, 0).unwrap();
+        assert_eq!(val, 65537);
+        assert_eq!(consumed, 5);
+    }
+
+    #[test]
+    fn read_compact_size_past_end() {
+        let data = [];
+        assert!(read_compact_size(&data, 0).is_err());
+    }
+
+    #[test]
+    fn sapling_tx_header_correct() {
+        // Version 3, type 10 in little-endian
+        assert_eq!(SAPLING_TX_HEADER, [0x03, 0x00, 0x0a, 0x00]);
+    }
+
+    #[test]
+    fn spend_output_sizes_correct() {
+        // cv(32) + anchor(32) + nullifier(32) + rk(32) + proof(192) + sig(64)
+        assert_eq!(SPEND_DESC_SIZE, 384);
+        // cv(32) + cmu(32) + epk(32) + enc(580) + out(80) + proof(192)
+        assert_eq!(OUTPUT_DESC_SIZE, 948);
+    }
+
+    #[test]
+    fn parse_sapling_tx_no_shielded_data() {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&SAPLING_TX_HEADER);
+        tx.push(0); // vin = 0
+        tx.push(0); // vout = 0
+        tx.extend([0u8; 4]); // nLockTime
+        tx.push(4); // payload length = 4
+        tx.extend([0x01, 0x00]); // payload nVersion
+        tx.push(0); // num_spends = 0
+        tx.push(0); // num_outputs = 0
+
+        let result = parse_sapling_tx(&tx).unwrap();
+        assert!(result.is_none());
+    }
+}
