@@ -4,7 +4,7 @@
 /// HTTP requests serve byte ranges from the file instead of re-fetching
 /// from the node on every request.
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::scanner::ShieldBlock;
@@ -29,22 +29,6 @@ pub fn append_blocks(file: &mut File, blocks: &[ShieldBlock]) -> std::io::Result
     Ok(entries)
 }
 
-/// Read a byte range from the cache file.
-pub fn read_range(file: &mut File, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; length as usize];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-/// Read from a byte offset to the end of the file.
-pub fn read_from(file: &mut File, offset: u64) -> std::io::Result<Vec<u8>> {
-    let end = file.seek(SeekFrom::End(0))?;
-    if offset >= end {
-        return Ok(Vec::new());
-    }
-    read_range(file, offset, end - offset)
-}
 
 #[cfg(test)]
 mod tests {
@@ -136,7 +120,8 @@ mod tests {
         assert_eq!(entries[0].1, 0);   // offset
         assert!(entries[0].2 > 0);     // length
 
-        let data = read_from(&mut file, 0).unwrap();
+        // Verify by reading the file back directly
+        let data = fs::read(path).unwrap();
         assert_eq!(data.len(), entries[0].2 as usize);
 
         fs::remove_file(path).ok();

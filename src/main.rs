@@ -102,11 +102,16 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
             shield_index.shield_heights.len());
     }
 
+    // Load entire shield.bin into memory for zero-disk-I/O serving
+    let shield_buffer = std::fs::read(cfg.cache_path).unwrap_or_default();
+    let buffer_mb = shield_buffer.len() as f64 / (1024.0 * 1024.0);
+    eprintln!("  [{label}] Shield buffer loaded: {buffer_mb:.1} MB in memory");
+
     Some(Arc::new(api::AppState {
         rpc: rpc::RpcClient::new(cfg.rpc_url, cfg.rpc_user, cfg.rpc_pass),
         index: RwLock::new(shield_index),
-        cache_path: cfg.cache_path.to_string(),
         cache_file: Mutex::new(cache_file),
+        shield_buffer: RwLock::new(shield_buffer),
         allowed_rpcs: cfg.allowed_rpcs.clone(),
     }))
 }
@@ -199,12 +204,24 @@ fn spawn_zmq_subscriber(
                 match scanner::scan_range(&rpc, scan_from, chain_height, |_, _| {}) {
                     Ok(blocks) => {
                         let count = blocks.len();
+                        // Encode new blocks for the in-memory buffer
+                        let new_bytes = stream::encode_shield_stream(
+                            &blocks, api::StreamFormat::PivxCompat,
+                        );
+
                         let rt = tokio::runtime::Handle::current();
                         rt.block_on(async {
+                            // Append to disk cache
                             let cache_entries = {
                                 let mut file = bg_state.cache_file.lock().await;
                                 cache::append_blocks(&mut file, &blocks).ok()
                             };
+
+                            // Append to in-memory buffer
+                            {
+                                let mut buffer = bg_state.shield_buffer.write().await;
+                                buffer.extend_from_slice(&new_bytes);
+                            }
 
                             let mut index = bg_state.index.write().await;
                             if let Some(entries) = cache_entries {

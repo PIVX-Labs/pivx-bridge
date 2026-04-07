@@ -10,7 +10,6 @@ use axum::Json;
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::cache;
 use crate::index::ShieldIndex;
 use crate::rpc::RpcClient;
 use crate::scanner;
@@ -20,8 +19,10 @@ use crate::stream;
 pub struct AppState {
     pub rpc: RpcClient,
     pub index: RwLock<ShieldIndex>,
-    pub cache_path: String,
     pub cache_file: Mutex<std::fs::File>,
+    /// In-memory shield buffer — the entire shield.bin held in RAM.
+    /// Requests serve slices directly from this buffer (zero disk I/O).
+    pub shield_buffer: RwLock<Vec<u8>>,
     pub allowed_rpcs: Vec<String>,
 }
 
@@ -78,30 +79,21 @@ pub async fn get_shield_data(
     let format = query.format;
     eprintln!("  [shielddata] Request startBlock={start} format={format:?}");
 
-    // For PIVX-compat format, serve from cache file
+    // For PIVX-compat format, serve directly from in-memory buffer
     if format == StreamFormat::PivxCompat {
-        let (offset, total_size) = {
+        let offset = {
             let index = state.index.read().await;
-            let offset = index.offset_for_height(start).unwrap_or(0);
-            let total = cache::cache_size(&state.cache_path);
-            (offset, total)
+            index.offset_for_height(start).unwrap_or(0) as usize
         };
 
-        if offset >= total_size {
+        let buffer = state.shield_buffer.read().await;
+        if offset >= buffer.len() {
             return Ok(build_binary_response(Vec::new()));
         }
 
-        let cache_path = state.cache_path.clone();
-        let data = tokio::task::spawn_blocking(move || {
-            let mut file = cache::open_cache(&cache_path)
-                .map_err(|e| format!("cache open: {e}"))?;
-            cache::read_from(&mut file, offset)
-                .map_err(|e| format!("cache read: {e}"))
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("task: {e}")))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
+        // Single allocation: copy the slice into the response
+        let data = buffer[offset..].to_vec();
+        drop(buffer); // release read lock before sending
         return Ok(build_binary_response(data));
     }
 
@@ -159,11 +151,11 @@ pub async fn get_shield_data_length(
 ) -> Result<String, (StatusCode, String)> {
     let start = query.start_block.unwrap_or(0);
     let end = query.end_block.unwrap_or(u32::MAX);
-    let total_cache = cache::cache_size(&state.cache_path);
+    let buffer_len = state.shield_buffer.read().await.len() as u64;
 
     let length = {
         let index = state.index.read().await;
-        index.byte_length_between(start, end, total_cache)
+        index.byte_length_between(start, end, buffer_len)
     };
 
     Ok(length.to_string())
