@@ -159,6 +159,7 @@ fn index_new_blocks(
         return;
     }
 
+    eprintln!("  [{label}] {source}: scanning {scan_from}..{chain_height}");
     match scanner::scan_range(&rpc, scan_from, chain_height, |_, _| {}) {
         Ok(blocks) => {
             let count = blocks.len();
@@ -288,9 +289,24 @@ fn spawn_block_subscriber(
             // Polling fallback: 10s interval until ZMQ is retried
             eprintln!("  [{label}] Polling active (10s interval)");
             for _ in 0..60 {
-                // Poll for ~10 minutes, then retry ZMQ
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
+                let rpc = rpc::RpcClient::new(&rpc_url, &rpc_user, &rpc_pass);
+                let chain_height = match rpc.get_block_count() {
+                    Ok(h) => h as u32,
+                    Err(e) => {
+                        eprintln!("  [{label}] Poll RPC error: {e}");
+                        continue;
+                    }
+                };
+
+                let last_height = state.index.read().await.last_height();
+                let scan_from = last_height.map(|h| h + 1).unwrap_or(0);
+                if scan_from > chain_height {
+                    continue;
+                }
+
+                eprintln!("  [{label}] Poll: scanning {scan_from}..{chain_height}");
                 let s = state.clone();
                 let r = rpc_url.clone();
                 let u = rpc_user.clone();
