@@ -36,9 +36,36 @@ pub async fn rpc_proxy(
 
     eprintln!("  [proxy] {method}({params:?})");
 
+    // Fast path: serve getblockhash from cache
+    if method == "getblockhash" {
+        if let Some(height) = params.first().and_then(|v| v.as_u64()).map(|h| h as u32) {
+            let cache = state.hash_cache.read().await;
+            if let Some(hash) = cache.get(height) {
+                return Ok(Json(Value::String(hash.to_string())));
+            }
+        }
+    }
+
     // Call the node
     let result = state.rpc.proxy_call(&method, &params)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+    // Populate cache for getblockhash and getblock responses
+    if method == "getblockhash" {
+        if let (Some(height), Some(hash)) = (
+            params.first().and_then(|v| v.as_u64()).map(|h| h as u32),
+            result.as_str(),
+        ) {
+            state.hash_cache.write().await.insert(height, hash.to_string());
+        }
+    } else if method == "getblock" {
+        if let (Some(height), Some(hash)) = (
+            result.get("height").and_then(|v| v.as_u64()).map(|h| h as u32),
+            result.get("hash").and_then(|v| v.as_str()),
+        ) {
+            state.hash_cache.write().await.insert(height, hash.to_string());
+        }
+    }
 
     // Apply jq filter if present — shells out to system `jq` for full compatibility
     let filtered = match &query.filter {

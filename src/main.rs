@@ -113,6 +113,8 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         cache_file: Mutex::new(cache_file),
         shield_buffer: RwLock::new(shield_buffer),
         allowed_rpcs: cfg.allowed_rpcs.clone(),
+        last_scanned_height: RwLock::new(chain_height),
+        hash_cache: RwLock::new(api::HashCache::new(1000)),
     }))
 }
 
@@ -149,17 +151,14 @@ fn index_new_blocks(
         }
     };
 
-    let last_height = {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async { state.index.read().await.last_height() })
-    };
+    let rt = tokio::runtime::Handle::current();
+    let last_scanned = rt.block_on(async { *state.last_scanned_height.read().await });
 
-    let scan_from = last_height.map(|h| h + 1).unwrap_or(0);
+    let scan_from = last_scanned + 1;
     if scan_from > chain_height {
         return;
     }
 
-    eprintln!("  [{label}] {source}: scanning {scan_from}..{chain_height}");
     match scanner::scan_range(&rpc, scan_from, chain_height, |_, _| {}) {
         Ok(blocks) => {
             let count = blocks.len();
@@ -192,6 +191,9 @@ fn index_new_blocks(
                 if let Err(e) = index.save(index_path) {
                     eprintln!("  [{label}] Index save failed: {e}");
                 }
+
+                // Update last scanned height
+                *state.last_scanned_height.write().await = chain_height;
             });
             if count > 0 {
                 eprintln!("  [{label}] {source}: indexed {count} new shield block(s) (chain: {chain_height})");
@@ -257,6 +259,7 @@ fn spawn_zmq_listener(
 }
 
 /// Spawn polling loop — always runs, catches anything ZMQ misses.
+/// Uses nextblockhash chaining instead of rescanning entire ranges.
 fn spawn_poller(
     label: &'static str,
     rpc_url: String,
@@ -270,20 +273,7 @@ fn spawn_poller(
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-            let rpc = rpc::RpcClient::new(&rpc_url, &rpc_user, &rpc_pass);
-            let chain_height = match rpc.get_block_count() {
-                Ok(h) => h as u32,
-                Err(e) => {
-                    eprintln!("  [{label}] Poll RPC error: {e}");
-                    continue;
-                }
-            };
-
-            let last_height = state.index.read().await.last_height();
-            let scan_from = last_height.map(|h| h + 1).unwrap_or(0);
-            if scan_from > chain_height {
-                continue;
-            }
+            let last_scanned = *state.last_scanned_height.read().await;
 
             let s = state.clone();
             let r = rpc_url.clone();
@@ -291,9 +281,65 @@ fn spawn_poller(
             let p = rpc_pass.clone();
             let i = index_path.clone();
             tokio::task::spawn_blocking(move || {
-                index_new_blocks(label, &r, &u, &p, &s, &i, "Poll");
+                poll_new_blocks(label, &r, &u, &p, &s, &i, last_scanned);
             }).await.ok();
         }
+    });
+}
+
+/// Poll for new blocks by chaining via nextblockhash from the last scanned block.
+fn poll_new_blocks(
+    label: &'static str,
+    rpc_url: &str,
+    rpc_user: &str,
+    rpc_pass: &str,
+    state: &Arc<api::AppState>,
+    index_path: &str,
+    last_scanned: u32,
+) {
+    let rpc = rpc::RpcClient::new(rpc_url, rpc_user, rpc_pass);
+
+    // Get the last scanned block to check for nextblockhash
+    let last_hash = match rpc.get_block_hash(last_scanned) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    let block_json = match rpc.get_block(&last_hash, 1) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+
+    // No new block yet — nothing to do
+    let next_hash = match block_json.get("nextblockhash").and_then(|v| v.as_str()) {
+        Some(h) => h.to_string(),
+        None => return,
+    };
+
+    // New block(s) exist — figure out range and scan
+    let chain_height = match rpc.get_block_count() {
+        Ok(h) => h as u32,
+        Err(_) => return,
+    };
+
+    let scan_from = last_scanned + 1;
+    if scan_from > chain_height {
+        return;
+    }
+
+    // Cache the hashes we already know
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(async {
+        let mut cache = state.hash_cache.write().await;
+        cache.insert(last_scanned, last_hash);
+        cache.insert(scan_from, next_hash);
+    });
+
+    index_new_blocks(label, rpc_url, rpc_user, rpc_pass, state, index_path, "Poll");
+
+    // Update last_scanned_height
+    rt.block_on(async {
+        *state.last_scanned_height.write().await = chain_height;
     });
 }
 

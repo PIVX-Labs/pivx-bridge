@@ -24,6 +24,44 @@ pub struct AppState {
     /// Requests serve slices directly from this buffer (zero disk I/O).
     pub shield_buffer: RwLock<Vec<u8>>,
     pub allowed_rpcs: Vec<String>,
+    /// Last chain height fully scanned (not just last shield block).
+    pub last_scanned_height: RwLock<u32>,
+    /// LRU cache: height → block hash. Eliminates redundant getblockhash RPCs.
+    pub hash_cache: RwLock<HashCache>,
+}
+
+/// Fixed-size LRU cache for block height → hash mappings.
+pub struct HashCache {
+    entries: std::collections::HashMap<u32, String>,
+    order: std::collections::VecDeque<u32>,
+    capacity: usize,
+}
+
+impl HashCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::with_capacity(capacity),
+            order: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    pub fn get(&self, height: u32) -> Option<&str> {
+        self.entries.get(&height).map(|s| s.as_str())
+    }
+
+    pub fn insert(&mut self, height: u32, hash: String) {
+        if self.entries.contains_key(&height) {
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(height, hash);
+        self.order.push_back(height);
+    }
 }
 
 // ---------------------------------------------------------------------------
