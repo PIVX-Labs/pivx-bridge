@@ -47,8 +47,8 @@ pub async fn rpc_proxy(
         }
     }
 
-    // Fast path: serve getblock from block cache (only when no jq filter)
-    if method == "getblock" && query.filter.as_ref().is_none_or(|f| f.is_empty()) {
+    // Fast path: serve getblock from block cache (then apply jq filter if needed)
+    if method == "getblock" {
         // First param can be a hash (string) or height (number) — resolve to hash
         let block_hash = if let Some(hash) = params.first().and_then(|v| v.as_str()) {
             Some(hash.to_string())
@@ -66,8 +66,16 @@ pub async fn rpc_proxy(
             let chain_h = state.chain_height.load(std::sync::atomic::Ordering::Relaxed);
             let cached = state.block_cache.read().unwrap().get(hash, verbosity, chain_h);
             if let Some(json) = cached {
+                // Apply jq filter if present, then return
+                let filtered = match &query.filter {
+                    Some(expr) if !expr.is_empty() => {
+                        apply_jq_system(&json, expr)
+                            .map_err(|e| (StatusCode::BAD_REQUEST, format!("jq filter error: {e}")))?
+                    }
+                    _ => json,
+                };
                 log_timing(start, &method);
-                return Ok(Json(json));
+                return Ok(Json(filtered));
             }
         }
     }
