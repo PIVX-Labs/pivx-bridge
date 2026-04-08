@@ -4,9 +4,9 @@
 /// potential issues with JSON serialization of Sapling txs.
 use crate::rpc::RpcClient;
 
-/// PIVX Sapling transaction: version 3, type 0. Unlike Kerrigan/Dash (type 10),
-/// PIVX uses the standard v3 header with the Sapling payload appended after nLockTime.
-const SAPLING_VERSION: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
+/// PIVX Sapling transaction header: nVersion=3 (i16 LE) + nType=0 (i16 LE).
+/// Kerrigan/Dash uses nType=10 (0x0a 0x00) for its Sapling-capable transactions.
+const SAPLING_HEADER: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 
 /// Size of each spend description in bytes.
 const SPEND_DESC_SIZE: usize = 384;
@@ -116,7 +116,7 @@ fn scan_block_inner(
         };
 
         // Check for PIVX v3 transaction (Sapling-capable)
-        if tx_bytes.len() >= 4 && tx_bytes[..4] == SAPLING_VERSION {
+        if tx_bytes.len() >= 4 && tx_bytes[..4] == SAPLING_HEADER {
             // Try to parse Sapling payload — returns None if no shielded data
             match parse_sapling_tx(&tx_bytes) {
                 Ok(Some(compact)) => {
@@ -229,10 +229,13 @@ pub fn scan_range(
 
 /// Parse a raw PIVX v3 transaction and extract Sapling data.
 ///
-/// PIVX format (type 0): version(4) + vin + vout + nLockTime(4) + valueBalance(8)
-///   + nSpends(varint) + spend_descs + nOutputs(varint) + output_descs + [bindingSig(64)]
+/// PIVX serialization (from PIVX Core `SerializeTransaction`):
+///   nVersion(i16) + nType(i16) + vin + vout + nLockTime(u32)
+///   + sapData discriminant(u8: 0x01=present, 0x00=absent)
+///   + SaplingTxData { valueBalance(i64) + vShieldedSpend + vShieldedOutput + bindingSig(64) }
 ///
-/// Unlike Kerrigan/Dash (type 10), there is no extra payload wrapper.
+/// The discriminant is the Optional<SaplingTxData> presence flag from PIVX's serialize.h.
+/// Kerrigan/Dash uses nType=10 with an extra payload wrapper instead.
 fn parse_sapling_tx(data: &[u8]) -> Result<Option<CompactTx>, String> {
     let mut pos = 4; // skip version header
 
@@ -265,9 +268,13 @@ fn parse_sapling_tx(data: &[u8]) -> Result<Option<CompactTx>, String> {
         return Ok(None);
     }
 
-    // PIVX Sapling fields:
-    // sapVersion (1 byte) + valueBalance (8 bytes) + spends + outputs + [bindingSig]
-    pos += 1; // sapVersion
+    // PIVX Sapling fields (Optional<SaplingTxData>):
+    // discriminant (1 byte: 0x01=present) + valueBalance (8 bytes) + spends + outputs + [bindingSig]
+    let discriminant = data[pos];
+    pos += 1;
+    if discriminant == 0x00 {
+        return Ok(None); // sapData absent
+    }
     if pos + 8 > data.len() { return Ok(None); }
     pos += 8; // valueBalance
 
@@ -436,48 +443,144 @@ mod tests {
     }
 
     #[test]
-    fn sapling_version_correct() {
-        // PIVX: version 3, type 0 (not type 10 like Kerrigan/Dash)
-        assert_eq!(SAPLING_VERSION, [0x03, 0x00, 0x00, 0x00]);
+    fn sapling_header_correct() {
+        // PIVX: nVersion=3 (i16 LE) + nType=0 (i16 LE)
+        assert_eq!(SAPLING_HEADER, [0x03, 0x00, 0x00, 0x00]);
     }
 
     #[test]
-    fn spend_output_sizes_correct() {
-        // cv(32) + anchor(32) + nullifier(32) + rk(32) + proof(192) + sig(64)
-        assert_eq!(SPEND_DESC_SIZE, 384);
-        // cv(32) + cmu(32) + epk(32) + enc(580) + out(80) + proof(192)
-        assert_eq!(OUTPUT_DESC_SIZE, 948);
+    fn spend_output_sizes_match_pivx_core() {
+        // From PIVX Core: SpendDescriptionV4 and OutputDescriptionV4
+        // cv(32) + anchor(32) + nullifier(32) + rk(32) + zkproof(192) + spendAuthSig(64)
+        assert_eq!(SPEND_DESC_SIZE, 32 + 32 + 32 + 32 + 192 + 64);
+        // cv(32) + cmu(32) + epk(32) + encCiphertext(580) + outCiphertext(80) + zkproof(192)
+        assert_eq!(OUTPUT_DESC_SIZE, 32 + 32 + 32 + 580 + 80 + 192);
     }
 
     #[test]
-    fn parse_sapling_tx_no_shielded_data() {
-        // PIVX format: version(4) + vin(0) + vout(0) + nLockTime(4)
-        // No Sapling fields → returns None
+    fn parse_no_sapling_data() {
+        // v3 tx with no Optional<SaplingTxData> — ends after nLockTime
         let mut tx = Vec::new();
-        tx.extend_from_slice(&SAPLING_VERSION);
+        tx.extend_from_slice(&SAPLING_HEADER);
         tx.push(0); // vin = 0
         tx.push(0); // vout = 0
         tx.extend([0u8; 4]); // nLockTime
-        // No valueBalance or shield data
 
         let result = parse_sapling_tx(&tx).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn parse_sapling_tx_empty_shield() {
-        // PIVX format: version + vin(0) + vout(0) + nLockTime + sapVersion + valueBalance + 0 spends + 0 outputs
+    fn parse_discriminant_absent() {
+        // Optional<SaplingTxData> discriminant = 0x00 (absent)
         let mut tx = Vec::new();
-        tx.extend_from_slice(&SAPLING_VERSION);
+        tx.extend_from_slice(&SAPLING_HEADER);
         tx.push(0); // vin = 0
         tx.push(0); // vout = 0
         tx.extend([0u8; 4]); // nLockTime
-        tx.push(1); // sapVersion
+        tx.push(0x00); // discriminant = absent
+
+        let result = parse_sapling_tx(&tx).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_discriminant_present_empty() {
+        // Optional<SaplingTxData> present but 0 spends, 0 outputs
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&SAPLING_HEADER);
+        tx.push(0); // vin = 0
+        tx.push(0); // vout = 0
+        tx.extend([0u8; 4]); // nLockTime
+        tx.push(0x01); // discriminant = present
         tx.extend([0u8; 8]); // valueBalance = 0
-        tx.push(0); // num_spends = 0
-        tx.push(0); // num_outputs = 0
+        tx.push(0); // nSpends = 0
+        tx.push(0); // nOutputs = 0
 
         let result = parse_sapling_tx(&tx).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_real_mainnet_tx() {
+        // Real PIVX mainnet tx from block 5361234
+        // txid: 1c49a5a4c2db52cd6a0695ed0df3d0807c4b70044294fab3e6b0d7b6e01eeb72
+        // 2 spends, 1 output, valueBalance = 13000000 sat
+        let hex = include_str!("../tests/mainnet_sapling_tx.hex");
+        let tx_bytes = hex_decode(hex.trim()).expect("valid hex");
+
+        // Verify header
+        assert_eq!(&tx_bytes[..4], &SAPLING_HEADER);
+        assert_eq!(tx_bytes.len(), 1835);
+
+        // Parse
+        let result = parse_sapling_tx(&tx_bytes).unwrap();
+        assert!(result.is_some(), "should find Sapling data");
+
+        let compact = result.unwrap();
+        assert_eq!(compact.nullifiers.len(), 2, "2 spends → 2 nullifiers");
+        assert_eq!(compact.outputs.len(), 1, "1 shielded output");
+
+        // Verify nullifiers are non-zero
+        assert!(compact.nullifiers[0].iter().any(|&b| b != 0));
+        assert!(compact.nullifiers[1].iter().any(|&b| b != 0));
+
+        // Verify output fields are non-zero
+        let out = &compact.outputs[0];
+        assert!(out.cv.iter().any(|&b| b != 0));
+        assert!(out.cmu.iter().any(|&b| b != 0));
+        assert!(out.epk.iter().any(|&b| b != 0));
+        assert!(out.enc_ciphertext.iter().any(|&b| b != 0));
+        assert!(out.out_ciphertext.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn parse_with_transparent_vout() {
+        // Synthetic tx: vin=0, vout=1 (P2PKH), then Sapling with 0 spends + 1 output
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&SAPLING_HEADER);
+        tx.push(0); // vin = 0
+        tx.push(1); // vout = 1
+        // vout[0]: value=1 PIV (100000000 sat)
+        tx.extend(100_000_000u64.to_le_bytes());
+        // P2PKH script: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+        tx.push(25); // script length
+        tx.push(0x76); tx.push(0xa9); tx.push(0x14);
+        tx.extend([0xAA; 20]); // dummy pubkey hash
+        tx.push(0x88); tx.push(0xac);
+        // nLockTime
+        tx.extend([0u8; 4]);
+        // discriminant = present
+        tx.push(0x01);
+        // valueBalance
+        tx.extend(50_000_000i64.to_le_bytes());
+        // 0 spends
+        tx.push(0);
+        // 1 output (948 bytes of dummy data)
+        tx.push(1);
+        let mut output_desc = vec![0u8; OUTPUT_DESC_SIZE];
+        // cv
+        output_desc[0] = 0x11;
+        // cmu
+        output_desc[32] = 0x22;
+        // epk
+        output_desc[64] = 0x33;
+        // enc_ciphertext starts at 96
+        output_desc[96] = 0x44;
+        // out_ciphertext starts at 676
+        output_desc[676] = 0x55;
+        tx.extend_from_slice(&output_desc);
+
+        let result = parse_sapling_tx(&tx).unwrap();
+        assert!(result.is_some());
+
+        let compact = result.unwrap();
+        assert_eq!(compact.nullifiers.len(), 0);
+        assert_eq!(compact.outputs.len(), 1);
+        assert_eq!(compact.outputs[0].cv[0], 0x11);
+        assert_eq!(compact.outputs[0].cmu[0], 0x22);
+        assert_eq!(compact.outputs[0].epk[0], 0x33);
+        assert_eq!(compact.outputs[0].enc_ciphertext[0], 0x44);
+        assert_eq!(compact.outputs[0].out_ciphertext[0], 0x55);
     }
 }
