@@ -3,6 +3,7 @@
 /// Uses verbosity 1 (txid list) + getrawtransaction (raw hex) to avoid
 /// potential issues with JSON serialization of Sapling txs.
 use crate::block_cache::BlockCache;
+use crate::hex;
 use crate::rpc::RpcClient;
 
 /// PIVX Sapling transaction header: nVersion=3 (i16 LE) + nType=0 (i16 LE).
@@ -147,7 +148,7 @@ fn scan_block_inner(
             continue;
         };
 
-        let tx_bytes = match hex_decode(&raw_hex) {
+        let tx_bytes = match hex::hex_decode(&raw_hex) {
             Some(b) => b,
             None => continue,
         };
@@ -433,17 +434,6 @@ fn read_compact_size(data: &[u8], pos: usize) -> Result<(usize, usize), String> 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Hex utilities
-// ---------------------------------------------------------------------------
-
-fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) { return None; }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
-}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -469,23 +459,6 @@ impl std::error::Error for ScanError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hex_decode_valid() {
-        assert_eq!(hex_decode("deadbeef"), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
-        assert_eq!(hex_decode("0300"), Some(vec![0x03, 0x00]));
-        assert_eq!(hex_decode(""), Some(vec![]));
-    }
-
-    #[test]
-    fn hex_decode_odd_length() {
-        assert_eq!(hex_decode("abc"), None);
-    }
-
-    #[test]
-    fn hex_decode_invalid_chars() {
-        assert_eq!(hex_decode("gg"), None);
-    }
 
     #[test]
     fn read_compact_size_single_byte() {
@@ -582,7 +555,7 @@ mod tests {
         // txid: 1c49a5a4c2db52cd6a0695ed0df3d0807c4b70044294fab3e6b0d7b6e01eeb72
         // 2 spends, 1 output, valueBalance = 13000000 sat
         let hex = include_str!("../tests/mainnet_sapling_tx.hex");
-        let tx_bytes = hex_decode(hex.trim()).expect("valid hex");
+        let tx_bytes = hex::hex_decode(hex.trim()).expect("valid hex");
 
         // Verify header
         assert_eq!(&tx_bytes[..4], &SAPLING_HEADER);

@@ -6,6 +6,7 @@ mod api;
 mod block_cache;
 mod cache;
 mod config;
+mod hex;
 mod index;
 mod proxy;
 mod rpc;
