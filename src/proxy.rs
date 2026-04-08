@@ -187,41 +187,58 @@ fn parse_params(raw: &str) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Inline jq filter — pure Rust via jaq (no process fork)
+// Inline jq filter — pure Rust via jaq, with compiled filter caching
 // ---------------------------------------------------------------------------
 
-/// Apply a jq filter expression to a JSON value using jaq (pure Rust).
-///
-/// Replaces the previous system `jq` binary approach — eliminates ~90ms
-/// process spawn overhead per request.
-fn apply_jq(value: &Value, expr: &str) -> Result<Value, String> {
-    use jaq_core::load::{Arena, File, Loader};
-    use jaq_core::{Compiler, Ctx, Vars};
+type JaqNative = jaq_core::Native<jaq_core::data::JustLut<jaq_json::Val>>;
+type JaqFilter = jaq_core::compile::Filter<JaqNative>;
 
-    // Parse input: serde_json::Value → string → jaq Val
-    let input_str = serde_json::to_string(value).map_err(|e| e.to_string())?;
-    let input = jaq_json::read::parse_single(input_str.as_bytes())
-        .map_err(|e| format!("jq input: {e}"))?;
+/// Compiled filter cache — each unique expression is compiled once and reused.
+static FILTER_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<JaqFilter>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    // Compile filter
-    let program = File { code: expr, path: () };
+/// Get a compiled filter from cache, or compile and cache it.
+fn get_compiled_filter(expr: &str) -> Result<Arc<JaqFilter>, String> {
+    let mut cache = FILTER_CACHE.lock().unwrap();
+    if let Some(compiled) = cache.get(expr) {
+        return Ok(compiled.clone());
+    }
+
+    let program = jaq_core::load::File { code: expr, path: () };
     let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
     type D = jaq_core::data::JustLut<jaq_json::Val>;
     let funs = jaq_core::funs::<D>().chain(jaq_std::funs()).chain(jaq_json::funs());
 
-    let loader = Loader::new(defs);
-    let arena = Arena::default();
+    let arena = jaq_core::load::Arena::default();
+    let loader = jaq_core::load::Loader::new(defs);
     let modules = loader.load(&arena, program)
         .map_err(|errs| format!("jq parse: {errs:?}"))?;
-    let filter = Compiler::default()
+    let compiled = jaq_core::Compiler::default()
         .with_funs(funs)
         .compile(modules)
         .map_err(|errs| format!("jq compile: {errs:?}"))?;
 
-    // Run filter
-    let ctx: Ctx<'_, D> = Ctx::new(&filter.lut, Vars::new([]));
-    let results: Vec<jaq_json::Val> = filter.id.run((ctx, input))
-        .map(|r| r.map_err(|e| format!("jq eval: {e:?}")))
+    let compiled = Arc::new(compiled);
+    cache.insert(expr.to_string(), compiled.clone());
+    Ok(compiled)
+}
+
+/// Apply a jq filter expression to a JSON value using jaq (pure Rust).
+///
+/// Filter compilation is cached — first call compiles, subsequent calls reuse.
+fn apply_jq(value: &Value, expr: &str) -> Result<Value, String> {
+    let compiled = get_compiled_filter(expr)?;
+
+    // Parse input: serde_json::Value → string → jaq Val
+    let input_str = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    let input: jaq_json::Val = jaq_json::read::parse_single(input_str.as_bytes())
+        .map_err(|e| format!("jq input: {e}"))?;
+
+    // Run cached compiled filter
+    type D = jaq_core::data::JustLut<jaq_json::Val>;
+    let ctx: jaq_core::Ctx<'_, D> = jaq_core::Ctx::new(&compiled.lut, jaq_core::Vars::new([]));
+    let results: Vec<jaq_json::Val> = compiled.id.run((ctx, input))
+        .map(|r: Result<jaq_json::Val, _>| r.map_err(|e| format!("jq eval: {e:?}")))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Convert results: jaq Val → string → serde_json::Value
@@ -230,7 +247,7 @@ fn apply_jq(value: &Value, expr: &str) -> Result<Value, String> {
         serde_json::from_str(&s).map_err(|e| format!("jq output: {e}"))
     } else {
         let values: Result<Vec<Value>, _> = results.iter()
-            .map(|v| serde_json::from_str(&v.to_string()))
+            .map(|v: &jaq_json::Val| serde_json::from_str(&v.to_string()))
             .collect();
         Ok(Value::Array(values.map_err(|e| format!("jq output: {e}"))?))
     }
