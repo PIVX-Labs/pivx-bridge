@@ -129,8 +129,81 @@ fn build_routes(state: Arc<api::AppState>) -> Router {
         .with_state(state)
 }
 
-/// Spawn ZMQ background subscriber for live block indexing.
-fn spawn_zmq_subscriber(
+/// Scan for new blocks and index them. Shared by both ZMQ and polling.
+fn index_new_blocks(
+    label: &'static str,
+    rpc_url: &str,
+    rpc_user: &str,
+    rpc_pass: &str,
+    state: &Arc<api::AppState>,
+    index_path: &str,
+    source: &str,
+) {
+    let rpc = rpc::RpcClient::new(rpc_url, rpc_user, rpc_pass);
+
+    let chain_height = match rpc.get_block_count() {
+        Ok(h) => h as u32,
+        Err(e) => {
+            eprintln!("  [{label}] {source} RPC error: {e}");
+            return;
+        }
+    };
+
+    let last_height = {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async { state.index.read().await.last_height() })
+    };
+
+    let scan_from = last_height.map(|h| h + 1).unwrap_or(0);
+    if scan_from > chain_height {
+        return;
+    }
+
+    match scanner::scan_range(&rpc, scan_from, chain_height, |_, _| {}) {
+        Ok(blocks) => {
+            let count = blocks.len();
+            let new_bytes = stream::encode_shield_stream(
+                &blocks, api::StreamFormat::PivxCompat,
+            );
+
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let cache_entries = {
+                    let mut file = state.cache_file.lock().await;
+                    cache::append_blocks(&mut file, &blocks).ok()
+                };
+
+                {
+                    let mut buffer = state.shield_buffer.write().await;
+                    buffer.extend_from_slice(&new_bytes);
+                }
+
+                let mut index = state.index.write().await;
+                if let Some(entries) = cache_entries {
+                    for (height, offset, _len) in entries {
+                        index.add(height, offset);
+                    }
+                } else {
+                    for block in &blocks {
+                        index.add(block.height, 0);
+                    }
+                }
+                if let Err(e) = index.save(index_path) {
+                    eprintln!("  [{label}] Index save failed: {e}");
+                }
+            });
+            if count > 0 {
+                eprintln!("  [{label}] {source}: indexed {count} new shield block(s) (chain: {chain_height})");
+            }
+        }
+        Err(e) => {
+            eprintln!("  [{label}] {source} scan error: {e}");
+        }
+    }
+}
+
+/// Spawn block indexer: tries ZMQ for instant notifications, falls back to 10s polling.
+fn spawn_block_subscriber(
     label: &'static str,
     zmq_url: String,
     rpc_url: String,
@@ -142,117 +215,93 @@ fn spawn_zmq_subscriber(
     tokio::spawn(async move {
         use futures::StreamExt;
 
-        // Outer loop: reconnect on failure
         loop {
+            // Try ZMQ first
             eprintln!("  [{label}] ZMQ subscribing to {zmq_url}...");
+            let zmq_result = bitcoincore_zmq::subscribe_async(&[&zmq_url]);
 
-            let mut subscriber = match bitcoincore_zmq::subscribe_async(&[&zmq_url]) {
-                Ok(s) => {
-                    eprintln!("  [{label}] ZMQ connected");
-                    s
-                }
-                Err(e) => {
-                    eprintln!("  [{label}] ZMQ failed: {e} — retrying in 10s");
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    continue;
-                }
-            };
+            match zmq_result {
+                Ok(mut subscriber) => {
+                    eprintln!("  [{label}] ZMQ connected — waiting for blocks...");
 
-            // Inner loop: process messages until disconnection
-            let mut disconnected = false;
-            while let Some(msg) = subscriber.next().await {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("  [{label}] ZMQ error: {e} — reconnecting");
-                        disconnected = true;
-                        break;
-                    }
-                };
+                    // Test if ZMQ actually delivers: wait up to 90s for first message
+                    let first_msg = tokio::time::timeout(
+                        std::time::Duration::from_secs(90),
+                        subscriber.next(),
+                    ).await;
 
-                if !matches!(msg, bitcoincore_zmq::Message::HashBlock(_, _)) {
-                    continue;
-                }
-
-            let bg_rpc_url = rpc_url.clone();
-            let bg_rpc_user = rpc_user.clone();
-            let bg_rpc_pass = rpc_pass.clone();
-            let bg_state = state.clone();
-            let bg_index_path = index_path.clone();
-
-            tokio::task::spawn_blocking(move || {
-                let rpc = rpc::RpcClient::new(&bg_rpc_url, &bg_rpc_user, &bg_rpc_pass);
-
-                let chain_height = match rpc.get_block_count() {
-                    Ok(h) => h as u32,
-                    Err(e) => {
-                        eprintln!("  [{label}] ZMQ RPC error: {e}");
-                        return;
-                    }
-                };
-
-                let last_height = {
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async { bg_state.index.read().await.last_height() })
-                };
-
-                let scan_from = last_height.map(|h| h + 1).unwrap_or(0);
-                if scan_from > chain_height {
-                    return;
-                }
-
-                match scanner::scan_range(&rpc, scan_from, chain_height, |_, _| {}) {
-                    Ok(blocks) => {
-                        let count = blocks.len();
-                        // Encode new blocks for the in-memory buffer
-                        let new_bytes = stream::encode_shield_stream(
-                            &blocks, api::StreamFormat::PivxCompat,
-                        );
-
-                        let rt = tokio::runtime::Handle::current();
-                        rt.block_on(async {
-                            // Append to disk cache
-                            let cache_entries = {
-                                let mut file = bg_state.cache_file.lock().await;
-                                cache::append_blocks(&mut file, &blocks).ok()
-                            };
-
-                            // Append to in-memory buffer
-                            {
-                                let mut buffer = bg_state.shield_buffer.write().await;
-                                buffer.extend_from_slice(&new_bytes);
+                    match first_msg {
+                        Ok(Some(Ok(msg))) => {
+                            eprintln!("  [{label}] ZMQ confirmed working");
+                            // Process the first message
+                            if matches!(msg, bitcoincore_zmq::Message::HashBlock(_, _)) {
+                                let s = state.clone();
+                                let r = rpc_url.clone();
+                                let u = rpc_user.clone();
+                                let p = rpc_pass.clone();
+                                let i = index_path.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    index_new_blocks(label, &r, &u, &p, &s, &i, "ZMQ");
+                                }).await.ok();
                             }
 
-                            let mut index = bg_state.index.write().await;
-                            if let Some(entries) = cache_entries {
-                                for (height, offset, _len) in entries {
-                                    index.add(height, offset);
-                                }
-                            } else {
-                                for block in &blocks {
-                                    index.add(block.height, 0);
+                            // ZMQ works — use it for subsequent blocks
+                            loop {
+                                match subscriber.next().await {
+                                    Some(Ok(msg)) => {
+                                        if !matches!(msg, bitcoincore_zmq::Message::HashBlock(_, _)) {
+                                            continue;
+                                        }
+                                        let s = state.clone();
+                                        let r = rpc_url.clone();
+                                        let u = rpc_user.clone();
+                                        let p = rpc_pass.clone();
+                                        let i = index_path.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            index_new_blocks(label, &r, &u, &p, &s, &i, "ZMQ");
+                                        }).await.ok();
+                                    }
+                                    Some(Err(e)) => {
+                                        eprintln!("  [{label}] ZMQ error: {e} — restarting");
+                                        break;
+                                    }
+                                    None => {
+                                        eprintln!("  [{label}] ZMQ stream ended — restarting");
+                                        break;
+                                    }
                                 }
                             }
-                            if let Err(e) = index.save(&bg_index_path) {
-                                eprintln!("  [{label}] Index save failed: {e}");
-                            }
-                        });
-                        if count > 0 {
-                            eprintln!("  [{label}] Indexed {count} new shield block(s)");
+                            // ZMQ broke mid-session, restart from the top
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
+                        _ => {
+                            eprintln!("  [{label}] ZMQ silent after 90s — falling back to polling");
                         }
                     }
-                    Err(e) => {
-                        eprintln!("  [{label}] Scan error: {e}");
-                    }
                 }
-            }).await.ok();
-            } // end inner while
-
-            if disconnected {
-                eprintln!("  [{label}] ZMQ reconnecting in 5s...");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Err(e) => {
+                    eprintln!("  [{label}] ZMQ failed: {e} — falling back to polling");
+                }
             }
-        } // end outer loop
+
+            // Polling fallback: 10s interval until ZMQ is retried
+            eprintln!("  [{label}] Polling active (10s interval)");
+            for _ in 0..60 {
+                // Poll for ~10 minutes, then retry ZMQ
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+                let s = state.clone();
+                let r = rpc_url.clone();
+                let u = rpc_user.clone();
+                let p = rpc_pass.clone();
+                let i = index_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    index_new_blocks(label, &r, &u, &p, &s, &i, "Poll");
+                }).await.ok();
+            }
+            eprintln!("  [{label}] Retrying ZMQ...");
+        }
     });
 }
 
@@ -284,7 +333,7 @@ async fn main() {
     }).expect("mainnet initialization failed");
 
     let mainnet_index_path = "shield_index.json".to_string();
-    spawn_zmq_subscriber(
+    spawn_block_subscriber(
         "mainnet",
         config.zmq_url.clone(),
         config.rpc_url.clone(), config.rpc_user.clone(), config.rpc_pass.clone(),
@@ -315,7 +364,7 @@ async fn main() {
             allowed_rpcs,
         }) {
             let testnet_index_path = "shield_index.testnet.json".to_string();
-            spawn_zmq_subscriber(
+            spawn_block_subscriber(
                 "testnet",
                 config.zmq_url.clone(),
                 testnet_url.clone(), testnet_user.to_string(), testnet_pass.to_string(),
