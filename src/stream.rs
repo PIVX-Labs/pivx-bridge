@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn pivx_compat_no_type_prefix_on_raw_tx() {
         // The raw tx bytes should NOT have an extra 0x03 prefix
-        let raw = vec![0x03, 0x00, 0x0a, 0x00, 0xDE, 0xAD];
+        let raw = vec![0x03, 0x00, 0x00, 0x00, 0xDE, 0xAD];
         let block = make_block(100, 1000, vec![make_fake_tx(raw.clone())]);
         let stream = encode_shield_stream(&[block], StreamFormat::PivxCompat);
 
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn pivx_compat_footer_after_txs() {
-        let raw = vec![0x03, 0x00, 0x0a, 0x00];
+        let raw = vec![0x03, 0x00, 0x00, 0x00];
         let block = make_block(2700501, 1700000000, vec![make_fake_tx(raw.clone())]);
         let stream = encode_shield_stream(&[block], StreamFormat::PivxCompat);
 
@@ -221,8 +221,8 @@ mod tests {
 
     #[test]
     fn pivx_compat_multi_tx_then_footer() {
-        let tx1 = vec![0x03, 0x00, 0x0a, 0x00, 0x01];
-        let tx2 = vec![0x03, 0x00, 0x0a, 0x00, 0x02, 0x03];
+        let tx1 = vec![0x03, 0x00, 0x00, 0x00, 0x01];
+        let tx2 = vec![0x03, 0x00, 0x00, 0x00, 0x02, 0x03];
         let block = make_block(500, 999, vec![
             make_fake_tx(tx1.clone()),
             make_fake_tx(tx2.clone()),
@@ -251,8 +251,8 @@ mod tests {
 
     #[test]
     fn pivx_compat_multi_block_ordering() {
-        let block1 = make_block(100, 1000, vec![make_fake_tx(vec![0x03, 0x00, 0x0a, 0x00])]);
-        let block2 = make_block(200, 2000, vec![make_fake_tx(vec![0x03, 0x00, 0x0a, 0x00])]);
+        let block1 = make_block(100, 1000, vec![make_fake_tx(vec![0x03, 0x00, 0x00, 0x00])]);
+        let block2 = make_block(200, 2000, vec![make_fake_tx(vec![0x03, 0x00, 0x00, 0x00])]);
         let stream = encode_shield_stream(&[block1, block2], StreamFormat::PivxCompat);
 
         // Find both footers
@@ -295,7 +295,7 @@ mod tests {
             }],
         };
         let block = make_block(500, 999, vec![
-            make_fake_tx_with_compact(vec![0x03, 0x00, 0x0a, 0x00], compact),
+            make_fake_tx_with_compact(vec![0x03, 0x00, 0x00, 0x00], compact),
         ]);
         let stream = encode_shield_stream(&[block], StreamFormat::Compact);
 
@@ -329,7 +329,7 @@ mod tests {
             }],
         };
         let block = make_block(500, 999, vec![
-            make_fake_tx_with_compact(vec![0x03, 0x00, 0x0a, 0x00], compact),
+            make_fake_tx_with_compact(vec![0x03, 0x00, 0x00, 0x00], compact),
         ]);
 
         let compact_stream = encode_shield_stream(&[block.clone()], StreamFormat::Compact);

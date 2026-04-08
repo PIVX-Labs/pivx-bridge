@@ -4,8 +4,9 @@
 /// potential issues with JSON serialization of Sapling txs.
 use crate::rpc::RpcClient;
 
-/// PIVX Sapling transaction header: version 3 (LE u16) + type 10 (LE u16).
-const SAPLING_TX_HEADER: [u8; 4] = [0x03, 0x00, 0x0a, 0x00];
+/// PIVX Sapling transaction: version 3, type 0. Unlike Kerrigan/Dash (type 10),
+/// PIVX uses the standard v3 header with the Sapling payload appended after nLockTime.
+const SAPLING_VERSION: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 
 /// Size of each spend description in bytes.
 const SPEND_DESC_SIZE: usize = 384;
@@ -114,10 +115,20 @@ fn scan_block_inner(
             None => continue,
         };
 
-        // Check for Sapling tx header (version 3, type 10)
-        if tx_bytes.len() >= 4 && tx_bytes[..4] == SAPLING_TX_HEADER {
-            let compact = parse_sapling_tx(&tx_bytes).ok().flatten();
-            txs.push(ShieldTx { raw: tx_bytes, compact });
+        // Check for PIVX v3 transaction (Sapling-capable)
+        if tx_bytes.len() >= 4 && tx_bytes[..4] == SAPLING_VERSION {
+            // Try to parse Sapling payload — returns None if no shielded data
+            match parse_sapling_tx(&tx_bytes) {
+                Ok(Some(compact)) => {
+                    txs.push(ShieldTx { raw: tx_bytes, compact: Some(compact) });
+                }
+                Ok(None) => {
+                    // v3 tx but no shielded data — skip
+                }
+                Err(_) => {
+                    // Parse failed — not a Sapling tx, skip
+                }
+            }
         }
     }
 
@@ -216,17 +227,22 @@ pub fn scan_range(
 // PIVX Sapling transaction parser
 // ---------------------------------------------------------------------------
 
-/// Parse a raw PIVX type 10 transaction and extract compact Sapling data.
+/// Parse a raw PIVX v3 transaction and extract Sapling data.
+///
+/// PIVX format (type 0): version(4) + vin + vout + nLockTime(4) + valueBalance(8)
+///   + nSpends(varint) + spend_descs + nOutputs(varint) + output_descs + [bindingSig(64)]
+///
+/// Unlike Kerrigan/Dash (type 10), there is no extra payload wrapper.
 fn parse_sapling_tx(data: &[u8]) -> Result<Option<CompactTx>, String> {
-    let mut pos = 4; // skip header
+    let mut pos = 4; // skip version header
 
     // Skip vin
     let (vin_count, br) = read_compact_size(data, pos)?;
     pos += br;
     for _ in 0..vin_count {
-        pos += 32 + 4; // prevout
+        pos += 32 + 4; // prevout (txid + vout)
         let (script_len, br) = read_compact_size(data, pos)?;
-        pos += br + script_len;
+        pos += br + script_len; // scriptSig
         pos += 4; // sequence
         if pos > data.len() { return Err("truncated vin".into()); }
     }
@@ -237,27 +253,30 @@ fn parse_sapling_tx(data: &[u8]) -> Result<Option<CompactTx>, String> {
     for _ in 0..vout_count {
         pos += 8; // value
         let (script_len, br) = read_compact_size(data, pos)?;
-        pos += br + script_len;
+        pos += br + script_len; // scriptPubKey
         if pos > data.len() { return Err("truncated vout".into()); }
     }
 
     // Skip nLockTime
     pos += 4;
 
-    // Read extra payload
-    let (payload_len, br) = read_compact_size(data, pos)?;
-    pos += br;
-
-    if pos + payload_len > data.len() {
-        return Err("truncated payload".into());
+    // If nothing remains after nLockTime, no Sapling data
+    if pos >= data.len() {
+        return Ok(None);
     }
 
-    parse_sapling_payload(&data[pos..pos + payload_len])
+    // PIVX Sapling fields follow directly (no payload wrapper):
+    // valueBalance (8 bytes)
+    if pos + 8 > data.len() { return Ok(None); }
+    pos += 8; // skip valueBalance
+
+    // Parse spend and output descriptions
+    parse_sapling_descs(data, pos)
 }
 
-/// Parse the Sapling extra payload to extract compact data.
-fn parse_sapling_payload(data: &[u8]) -> Result<Option<CompactTx>, String> {
-    let mut pos = 2; // skip payload nVersion (u16)
+/// Parse Sapling spend/output descriptions from the given offset.
+fn parse_sapling_descs(data: &[u8], start: usize) -> Result<Option<CompactTx>, String> {
+    let mut pos = start;
 
     // Spend descriptions
     let (num_spends, br) = read_compact_size(data, pos)?;
@@ -416,9 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn sapling_tx_header_correct() {
-        // Version 3, type 10 in little-endian
-        assert_eq!(SAPLING_TX_HEADER, [0x03, 0x00, 0x0a, 0x00]);
+    fn sapling_version_correct() {
+        // PIVX: version 3, type 0 (not type 10 like Kerrigan/Dash)
+        assert_eq!(SAPLING_VERSION, [0x03, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -431,13 +450,28 @@ mod tests {
 
     #[test]
     fn parse_sapling_tx_no_shielded_data() {
+        // PIVX format: version(4) + vin(0) + vout(0) + nLockTime(4)
+        // No Sapling fields → returns None
         let mut tx = Vec::new();
-        tx.extend_from_slice(&SAPLING_TX_HEADER);
+        tx.extend_from_slice(&SAPLING_VERSION);
         tx.push(0); // vin = 0
         tx.push(0); // vout = 0
         tx.extend([0u8; 4]); // nLockTime
-        tx.push(4); // payload length = 4
-        tx.extend([0x01, 0x00]); // payload nVersion
+        // No valueBalance or shield data
+
+        let result = parse_sapling_tx(&tx).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_sapling_tx_empty_shield() {
+        // PIVX format with valueBalance but 0 spends and 0 outputs
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&SAPLING_VERSION);
+        tx.push(0); // vin = 0
+        tx.push(0); // vout = 0
+        tx.extend([0u8; 4]); // nLockTime
+        tx.extend([0u8; 8]); // valueBalance = 0
         tx.push(0); // num_spends = 0
         tx.push(0); // num_outputs = 0
 
