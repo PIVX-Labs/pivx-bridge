@@ -40,13 +40,13 @@ pub async fn rpc_proxy(
     let result = state.rpc.proxy_call(&method, &params)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
 
-    // Apply jq filter if present
+    // Apply jq filter if present — shells out to system `jq` for full compatibility
     let filtered = match &query.filter {
         Some(expr) if !expr.is_empty() => {
             if expr.len() > 10_000 {
                 return Err((StatusCode::BAD_REQUEST, "filter expression too long".into()));
             }
-            apply_jq_filter(&result, expr, 0)
+            apply_jq_system(&result, expr)
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("jq filter error: {e}")))?
         }
         _ => result,
@@ -92,159 +92,44 @@ fn parse_params(raw: &str) -> Vec<Value> {
 // Minimal jq evaluator — covers the subset MPW actually uses
 // ---------------------------------------------------------------------------
 
-const JQ_MAX_DEPTH: u32 = 50;
-
-/// Apply a jq-style filter expression to a JSON value.
+/// Apply a jq filter by shelling out to the system `jq` binary.
 ///
-/// Supports the subset used by MPW: identity (`.`), field access (`.field`),
-/// array iteration (`.[]`), pipe (`|`), object construction (`{a, b}`),
-/// and optional access (`.field?`).
-pub fn apply_jq_filter(value: &Value, expr: &str, depth: u32) -> Result<Value, String> {
-    if depth > JQ_MAX_DEPTH {
-        return Err("jq recursion limit exceeded".into());
+/// This gives 100% jq compatibility — same as PivxNodeController's `node-jq`.
+fn apply_jq_system(value: &Value, expr: &str) -> Result<Value, String> {
+    let input = serde_json::to_string(value).map_err(|e| e.to_string())?;
+
+    let output = std::process::Command::new("jq")
+        .arg("-c")
+        .arg(expr)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes())?;
+            child.wait_with_output()
+        })
+        .map_err(|e| format!("jq execution failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("jq error: {}", stderr.trim()));
     }
 
-    let expr = expr.trim();
-    if expr.is_empty() || expr == "." {
-        return Ok(value.clone());
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
 
-    // Split on top-level pipe (not inside braces)
-    if let Some((left, right)) = split_pipe(expr) {
-        let intermediate = apply_jq_filter(value, left, depth + 1)?;
-        return apply_jq_filter(&intermediate, right, depth + 1);
-    }
-
-    // Object construction: {a, b, c} or {a: .field, b: .other}
-    if expr.starts_with('{') && expr.ends_with('}') {
-        return eval_object_construction(value, &expr[1..expr.len()-1], depth + 1);
-    }
-
-    // Array iteration: .[]
-    if expr == ".[]" {
-        return eval_array_iter(value);
-    }
-
-    // Field access: .field or .field.nested or .field?
-    if let Some(field_expr) = expr.strip_prefix('.') {
-        let optional = field_expr.ends_with('?');
-        let field_expr = if optional { field_expr.strip_suffix('?').unwrap() } else { field_expr };
-
-        // Handle .[] after field access: .field[]
-        if let Some(field) = field_expr.strip_suffix("[]") {
-            let accessed = access_field(value, field, optional)?;
-            return eval_array_iter(&accessed);
-        }
-
-        return access_field(value, field_expr, optional);
-    }
-
-    Err(format!("unsupported jq expression: {expr}"))
-}
-
-/// Split on top-level pipe `|` (not inside braces or brackets).
-fn split_pipe(expr: &str) -> Option<(&str, &str)> {
-    let mut depth = 0;
-    for (i, c) in expr.char_indices() {
-        match c {
-            '{' | '[' | '(' => depth += 1,
-            '}' | ']' | ')' => depth -= 1,
-            '|' if depth == 0 => {
-                return Some((expr[..i].trim(), expr[i+1..].trim()));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Access a (possibly nested) field on a value.
-fn access_field(value: &Value, field_path: &str, optional: bool) -> Result<Value, String> {
-    // Handle array — apply field access to each element
-    if let Value::Array(arr) = value {
-        let results: Vec<Value> = arr.iter()
-            .filter_map(|item| access_field(item, field_path, true).ok())
-            .filter(|v| !v.is_null())
+    // jq may output multiple lines (one per result) — collect as array
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() == 1 {
+        serde_json::from_str(lines[0]).map_err(|e| format!("jq output parse error: {e}"))
+    } else {
+        let values: Result<Vec<Value>, _> = lines.iter()
+            .map(|line| serde_json::from_str(line))
             .collect();
-        return Ok(Value::Array(results));
+        Ok(Value::Array(values.map_err(|e| format!("jq output parse error: {e}"))?))
     }
-
-    let mut current = value;
-    for field in field_path.split('.') {
-        if field.is_empty() { continue; }
-        match current.get(field) {
-            Some(v) => current = v,
-            None => {
-                if optional {
-                    return Ok(Value::Null);
-                }
-                return Err(format!("field '{field}' not found"));
-            }
-        }
-    }
-    Ok(current.clone())
-}
-
-/// Iterate over array elements (or object values).
-fn eval_array_iter(value: &Value) -> Result<Value, String> {
-    match value {
-        Value::Array(arr) => Ok(Value::Array(arr.clone())),
-        Value::Object(obj) => Ok(Value::Array(obj.values().cloned().collect())),
-        _ => Err("cannot iterate over non-array/object".into()),
-    }
-}
-
-/// Evaluate object construction: `{a, b, c}` or `{a: .field, b: .other}`.
-fn eval_object_construction(value: &Value, fields_str: &str, depth: u32) -> Result<Value, String> {
-    // Handle array input — apply construction to each element
-    if let Value::Array(arr) = value {
-        let results: Vec<Value> = arr.iter()
-            .map(|item| eval_object_construction(item, fields_str, depth))
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(Value::Array(results));
-    }
-
-    let mut obj = serde_json::Map::new();
-
-    for field_def in split_fields(fields_str) {
-        let field_def = field_def.trim();
-        if field_def.is_empty() { continue; }
-
-        if let Some((key, val_expr)) = field_def.split_once(':') {
-            // Explicit: {key: .value_expr}
-            let key = key.trim().trim_matches('"');
-            let val = apply_jq_filter(value, val_expr.trim(), depth)?;
-            obj.insert(key.to_string(), val);
-        } else {
-            // Shorthand: {fieldname} = {fieldname: .fieldname}
-            let key = field_def.trim().trim_matches('"');
-            let val = value.get(key).cloned().unwrap_or(Value::Null);
-            obj.insert(key.to_string(), val);
-        }
-    }
-
-    Ok(Value::Object(obj))
-}
-
-/// Split field definitions by comma, respecting nested expressions.
-fn split_fields(s: &str) -> Vec<&str> {
-    let mut fields = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-
-    for (i, c) in s.char_indices() {
-        match c {
-            '{' | '[' | '(' => depth += 1,
-            '}' | ']' | ')' => depth -= 1,
-            ',' if depth == 0 => {
-                fields.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    fields.push(&s[start..]);
-    fields
 }
 
 #[cfg(test)]
@@ -269,63 +154,39 @@ mod tests {
     #[test]
     fn jq_identity() {
         let v = json!({"a": 1});
-        assert_eq!(apply_jq_filter(&v, ".", 0).unwrap(), v);
+        assert_eq!(apply_jq_system(&v, ".").unwrap(), v);
     }
 
     #[test]
     fn jq_field_access() {
         let v = json!({"name": "test", "value": 42});
-        assert_eq!(apply_jq_filter(&v, ".name", 0).unwrap(), json!("test"));
-        assert_eq!(apply_jq_filter(&v, ".value", 0).unwrap(), json!(42));
+        assert_eq!(apply_jq_system(&v, ".name").unwrap(), json!("test"));
+        assert_eq!(apply_jq_system(&v, ".value").unwrap(), json!(42));
     }
 
     #[test]
     fn jq_nested_field() {
         let v = json!({"a": {"b": {"c": 99}}});
-        assert_eq!(apply_jq_filter(&v, ".a.b.c", 0).unwrap(), json!(99));
-    }
-
-    #[test]
-    fn jq_array_iter() {
-        let v = json!([1, 2, 3]);
-        assert_eq!(apply_jq_filter(&v, ".[]", 0).unwrap(), json!([1, 2, 3]));
+        assert_eq!(apply_jq_system(&v, ".a.b.c").unwrap(), json!(99));
     }
 
     #[test]
     fn jq_pipe() {
         let v = json!({"data": [1, 2, 3]});
-        assert_eq!(apply_jq_filter(&v, ".data | .[]", 0).unwrap(), json!([1, 2, 3]));
+        assert_eq!(apply_jq_system(&v, ".data | .[]").unwrap(), json!([1, 2, 3]));
     }
 
     #[test]
-    fn jq_object_construction_shorthand() {
+    fn jq_object_construction() {
         let v = json!({"name": "Alice", "age": 30, "extra": "skip"});
-        let result = apply_jq_filter(&v, "{name, age}", 0).unwrap();
-        assert_eq!(result, json!({"name": "Alice", "age": 30}));
+        assert_eq!(apply_jq_system(&v, "{name, age}").unwrap(), json!({"name": "Alice", "age": 30}));
     }
 
     #[test]
-    fn jq_array_iter_then_object() {
-        let v = json!([
-            {"name": "A", "Hash": "abc", "extra": 1},
-            {"name": "B", "Hash": "def", "extra": 2},
-        ]);
-        let result = apply_jq_filter(&v, ".[] | {name, Hash}", 0).unwrap();
-        assert_eq!(result, json!([
-            {"name": "A", "Hash": "abc"},
-            {"name": "B", "Hash": "def"},
-        ]));
-    }
-
-    #[test]
-    fn jq_optional_field() {
-        let v = json!({"a": 1});
-        assert_eq!(apply_jq_filter(&v, ".missing?", 0).unwrap(), Value::Null);
-    }
-
-    #[test]
-    fn jq_depth_limit() {
-        let v = json!({"a": 1});
-        assert!(apply_jq_filter(&v, ".a", JQ_MAX_DEPTH + 1).is_err());
+    fn jq_complex_assignment() {
+        // The expression MPW actually uses
+        let v = json!({"tx": [{"hex": "abc", "txid": "123", "extra": true}]});
+        let result = apply_jq_system(&v, ". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)").unwrap();
+        assert_eq!(result, json!({"txs": [{"hex": "abc", "txid": "123"}]}));
     }
 }

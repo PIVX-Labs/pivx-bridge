@@ -83,7 +83,10 @@ pub async fn get_shield_data(
     if format == StreamFormat::PivxCompat {
         let offset = {
             let index = state.index.read().await;
-            index.offset_for_height(start).unwrap_or(0) as usize
+            match index.offset_for_height(start) {
+                Some(o) => o as usize,
+                None => return Ok(build_binary_response(Vec::new())),
+            }
         };
 
         let buffer = state.shield_buffer.read().await;
