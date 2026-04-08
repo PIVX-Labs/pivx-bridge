@@ -8,15 +8,27 @@
 
 A shield sync bridge that connects to a PIVX full node, scans for Sapling shielded transactions, and serves compact shield data to light wallets over HTTP. Fully compatible with [MyPIVXWallet](https://github.com/PIVX-Labs/MyPIVXWallet) — zero client changes required.
 
-## Why?
+## Performance
 
-PivxNodeController is written in Node.js. PIVX Bridge replaces it with a single Rust binary that:
+Benchmarked head-to-head against PivxNodeController on the same production server:
 
-- **Starts faster** — scans the full chain in a fraction of the time
-- **Uses less memory** — no V8 heap, no garbage collector
-- **Responds instantly** — serves from a pre-built binary cache on disk
-- **Stays current** — ZMQ block notifications instead of 60-second polling (PivxNodeController can delay shield tx visibility by up to a full block)
-- **Saves bandwidth** — opt-in compact formats cut sync data by 24-42%
+| Benchmark | PNC | Bridge | Improvement |
+|-----------|-----|--------|-------------|
+| getblockcount | 4.2ms | 2.0ms | **2x** |
+| getshieldblocks (34k JSON) | 11.2ms | 3.8ms | **3x** |
+| getshielddata full (200MB) | 2.12s | 0.75s | **2.8x** |
+| **getshielddata incremental** | **499ms** | **1.0ms** | **494x** |
+| New block visibility | 60s (polling) | Instant (ZMQ) | **~** |
+| RSS memory | 386MB | 210MB | **46% less** |
+| VSZ memory | 1.9GB | 627MB | **67% less** |
+
+### How
+
+- **In-memory shield buffer** — the entire shield dataset (~200MB) is held in RAM. Requests serve a memory slice directly — zero disk I/O, zero file handle contention
+- **Binary search indexing** — block lookups in O(log n) instead of linear scan. 17 comparisons for 34,000 shield blocks
+- **Inline tx extraction** — `getblock` verbosity 2 returns tx hex inline, eliminating a separate RPC call per transaction. 100x fewer RPC calls during chain scan
+- **ZMQ block notifications** — new shield transactions are indexed instantly on block arrival, not discovered 60 seconds later by a polling loop
+- **Opt-in compact formats** — strip Groth16 proofs and signatures that light wallets never verify, cutting sync data by 24-42%
 
 ## Quick Start
 
@@ -64,6 +76,7 @@ All endpoints are served at both `/mainnet/...` and `/...` (without prefix).
 | `/mainnet/getshielddatalength?startBlock=N&endBlock=M` | GET | Byte count (for progress bars) |
 | `/mainnet/getshieldblocks` | GET | JSON array of shield block heights |
 | `/mainnet/sendrawtransaction` | POST | Broadcast raw transaction hex |
+| `/mainnet/address_index` | GET | SQLite address index (for MPW-Tauri) |
 
 ### RPC Proxy
 
@@ -71,7 +84,7 @@ All endpoints are served at both `/mainnet/...` and `/...` (without prefix).
 |-------|--------|-------------|
 | `/mainnet/:method?params=a,b,c&filter=<jq>` | GET | Proxied RPC call with optional jq filtering |
 
-The proxy validates methods against a configurable whitelist. Parameters are automatically type-coerced (numbers, booleans, strings).
+The proxy validates methods against a configurable whitelist. Parameters are automatically type-coerced (numbers, booleans, strings). The `filter` parameter uses the system `jq` binary for full compatibility.
 
 ### Stream Formats
 
@@ -115,13 +128,13 @@ CompactPlus (opt-in):
 src/
   main.rs       Startup, initial scan, ZMQ subscriber, axum server
   config.rs     CLI args + .env configuration
-  rpc.rs        JSON-RPC 1.0 client with auth + connection pooling
-  scanner.rs    Block scanner + PIVX type 10 Sapling tx parser
+  rpc.rs        JSON-RPC 1.0 client with auth + connection pooling + 30s timeout
+  scanner.rs    Block scanner + PIVX type 10 Sapling tx parser (verbosity 2)
   stream.rs     Binary stream encoder (PivxCompat / Compact / CompactPlus)
-  cache.rs      Persistent shield.bin binary cache
-  index.rs      Shield block index with byte offsets (shield.json compat)
-  api.rs        HTTP endpoints (axum handlers)
-  proxy.rs      RPC proxy with jq filtering
+  cache.rs      Persistent shield.bin cache with crash recovery
+  index.rs      Binary search index with byte offsets (shield.json compat)
+  api.rs        HTTP endpoints with in-memory buffer serving
+  proxy.rs      RPC proxy with system jq filtering
 ```
 
 ## Configuration
@@ -136,6 +149,7 @@ All options support both CLI flags and environment variables:
 | `--zmq-url` | `ZMQ_URL` | `tcp://127.0.0.1:28332` | ZMQ hashblock endpoint |
 | `--port` | `PORT` | `3000` | HTTP server port |
 | `--sapling-height` | `SAPLING_HEIGHT` | `2700501` | Sapling activation block |
+| `--no-compression` | `NO_COMPRESSION` | `false` | Disable gzip (use behind nginx) |
 | `--allowed-rpcs` | `ALLOWED_RPCS` | (see below) | Comma-separated RPC whitelist |
 
 Default allowed RPCs: `getblockcount`, `getblockhash`, `getblock`, `getrawtransaction`, `sendrawtransaction`, `getmasternodecount`, `listmasternodes`, `getbudgetprojection`, `getbudgetinfo`, `getbudgetvotes`
@@ -147,21 +161,23 @@ The bridge writes two files in the working directory:
 - **`shield.bin`** — Pre-encoded binary shield stream (append-only, survives restarts)
 - **`shield_index.json`** — Block height to byte offset index (PivxNodeController `shield.json` compatible)
 
+On startup, `shield.bin` is validated and truncated to the last complete block footer if a previous run crashed mid-write.
+
 ## Testing
 
 ```bash
-cargo test    # 36 tests
+cargo test    # 40 tests
 cargo clippy  # Zero warnings
 ```
 
 ## Migrating from PivxNodeController
 
-1. Build the bridge: `cargo build --release`
+1. Download the [latest release](https://github.com/PIVX-Labs/pivx-bridge/releases) or build from source
 2. Copy your `.env` credentials (same format)
-3. Point your reverse proxy at the bridge instead of the Node.js server
-4. MPW connects unchanged — the binary protocol and API are identical
-
-The bridge will re-scan from Sapling activation on first run and build its own `shield.bin`.
+3. Copy `shield.bin` and `shield.json` from PivxNodeController (rename `shield.json` to `shield_index.json`)
+4. Install `jq` on the server (`apt install jq`) for RPC proxy filter support
+5. Point your reverse proxy at the bridge instead of the Node.js server
+6. MPW connects unchanged — the binary protocol and API are identical
 
 ## License
 
