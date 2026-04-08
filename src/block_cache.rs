@@ -42,14 +42,23 @@ impl BlockCache {
 
     /// Look up a cached block, rehydrating `confirmations` and `nextblockhash`.
     ///
+    /// Falls back to other verbosity levels on miss — a verbosity 2 response
+    /// is a superset of verbosity 1, so serving it for a v1 request is safe.
     /// Read-only on the map — only atomics are mutated (hit/miss counters).
     pub fn get(&self, hash: &str, verbosity: u8, chain_height: u32) -> Option<Value> {
         let key = (hash.to_string(), verbosity);
         let entry = match self.entries.get(&key) {
             Some(e) => e,
             None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
+                // Fallback: try other verbosity levels (v2 is superset of v1)
+                let fallback = if verbosity == 1 { 2u8 } else { 1u8 };
+                match self.entries.get(&(hash.to_string(), fallback)) {
+                    Some(e) => e,
+                    None => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                }
             }
         };
 
@@ -241,14 +250,19 @@ mod tests {
     }
 
     #[test]
-    fn different_verbosity_cached_separately() {
+    fn verbosity_fallback() {
         let mut cache = BlockCache::new(10);
         let block = make_block(100, "abc");
-        cache.insert("abc", 1, &block);
+
+        // Insert at v2 only
         cache.insert("abc", 2, &block);
-        assert_eq!(cache.entries.len(), 2);
-        assert!(cache.get("abc", 1, 200).is_some());
+        assert_eq!(cache.entries.len(), 1);
+
+        // v2 lookup: direct hit
         assert!(cache.get("abc", 2, 200).is_some());
+        // v1 lookup: falls back to v2 (superset)
+        assert!(cache.get("abc", 1, 200).is_some());
+        // v0 lookup: no fallback (v0 is hex, not JSON)
         assert!(cache.get("abc", 0, 200).is_none());
     }
 }
