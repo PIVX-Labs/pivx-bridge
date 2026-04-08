@@ -1,6 +1,7 @@
 /// HTTP API — axum endpoints for the PIVX bridge.
 ///
 /// All routes are prefixed with `/mainnet/` for PivxNodeController compatibility.
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
@@ -10,6 +11,7 @@ use axum::Json;
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::block_cache::BlockCache;
 use crate::index::ShieldIndex;
 use crate::rpc::RpcClient;
 use crate::scanner;
@@ -28,6 +30,11 @@ pub struct AppState {
     pub last_scanned_height: RwLock<u32>,
     /// LRU cache: height → block hash. Eliminates redundant getblockhash RPCs.
     pub hash_cache: RwLock<HashCache>,
+    /// Block JSON cache: `(hash, verbosity)` → stripped response.
+    /// Eliminates repeated `getblock` RPCs for the same blocks.
+    pub block_cache: std::sync::RwLock<BlockCache>,
+    /// Current chain height — updated by ZMQ/polling, used for rehydration.
+    pub chain_height: AtomicU32,
 }
 
 /// Fixed-size LRU cache for block height → hash mappings.
@@ -152,12 +159,14 @@ pub async fn get_shield_data(
     let rpc_url = state.rpc.url().to_string();
     let rpc_user = state.rpc.user().to_string();
     let rpc_pass = state.rpc.pass().to_string();
+    let state_ref = state.clone();
 
     let data = tokio::task::spawn_blocking(move || {
         let rpc = RpcClient::new(&rpc_url, &rpc_user, &rpc_pass);
+        let chain_h = state_ref.chain_height.load(Ordering::Relaxed);
         let mut blocks = Vec::new();
         for height in heights {
-            match scanner::scan_block(&rpc, height) {
+            match scanner::scan_block(&rpc, height, &state_ref.block_cache, chain_h) {
                 Ok(Some(block)) => blocks.push(block),
                 Ok(None) => {}
                 Err(e) => return Err(format!("scan error at height {height}: {e}")),

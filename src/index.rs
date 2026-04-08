@@ -78,6 +78,12 @@ impl ShieldIndex {
         self.entries.get(idx).map(|e| e.i)
     }
 
+    /// Remove all entries at or above the given height (for reorg handling).
+    pub fn remove_from(&mut self, height: u32) {
+        self.entries.retain(|e| e.block < height);
+        self.shield_heights.retain(|&h| h < height);
+    }
+
     /// Compute the total byte length of shield data between two block heights.
     ///
     /// Used by `getshielddatalength` to report progress without materializing the stream.

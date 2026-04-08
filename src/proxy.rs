@@ -47,11 +47,26 @@ pub async fn rpc_proxy(
         }
     }
 
+    // Fast path: serve getblock from block cache (only when no jq filter)
+    if method == "getblock" && query.filter.as_ref().is_none_or(|f| f.is_empty()) {
+        if let Some(hash) = params.first().and_then(|v| v.as_str()) {
+            let verbosity = params.get(1)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u8;
+            let chain_h = state.chain_height.load(std::sync::atomic::Ordering::Relaxed);
+            let cached = state.block_cache.read().unwrap().get(hash, verbosity, chain_h);
+            if let Some(json) = cached {
+                log_timing(start, &method);
+                return Ok(Json(json));
+            }
+        }
+    }
+
     // Call the node
     let result = state.rpc.proxy_call(&method, &params)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
 
-    // Populate cache for getblockhash and getblock responses
+    // Populate caches for getblockhash and getblock responses
     if method == "getblockhash" {
         if let (Some(height), Some(hash)) = (
             params.first().and_then(|v| v.as_u64()).map(|h| h as u32),
@@ -65,6 +80,12 @@ pub async fn rpc_proxy(
             result.get("hash").and_then(|v| v.as_str()),
         ) {
             state.hash_cache.write().await.insert(height, hash.to_string());
+
+            // Also populate block cache
+            let verbosity = params.get(1)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u8;
+            state.block_cache.write().unwrap().insert(hash, verbosity, &result);
         }
     }
 
@@ -80,7 +101,22 @@ pub async fn rpc_proxy(
         _ => result,
     };
 
-    log_timing(start, &method);
+    // Log timing + cache stats for getblock
+    if method == "getblock" {
+        let (hits, misses, cached) = state.block_cache.read().unwrap().stats();
+        use std::io::Write;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let stderr = std::io::stderr();
+        let mut w = stderr.lock();
+        let total = hits + misses;
+        if ms >= 1.0 {
+            let _ = writeln!(w, "  [proxy {ms:.0}ms] {method} (cache: {hits}/{total} hits, {cached} blocks)");
+        } else {
+            let _ = writeln!(w, "  [proxy {ms:.2}ms] {method} (cache: {hits}/{total} hits, {cached} blocks)");
+        }
+    } else {
+        log_timing(start, &method);
+    }
     Ok(Json(filtered))
 }
 

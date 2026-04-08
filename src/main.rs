@@ -3,6 +3,7 @@
 /// Connects to a PIVX full node, scans for Sapling transactions, and serves
 /// shield data to light wallets (MyPIVXWallet) over HTTP.
 mod api;
+mod block_cache;
 mod cache;
 mod config;
 mod index;
@@ -11,6 +12,7 @@ mod rpc;
 mod scanner;
 mod stream;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use axum::routing::{get, post};
@@ -64,10 +66,13 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         .map(|h| h + 1)
         .unwrap_or(cfg.sapling_height);
 
+    // Block cache — 1000 blocks covers the tip range where most traffic is
+    let block_cache = std::sync::RwLock::new(block_cache::BlockCache::new(1000));
+
     if scan_from <= chain_height {
         eprintln!("  [{label}] Scanning blocks {scan_from}..{chain_height}...");
 
-        match scanner::scan_range(&rpc, scan_from, chain_height, |done, total| {
+        match scanner::scan_range(&rpc, scan_from, chain_height, &block_cache, chain_height, |done, total| {
             if total > 0 && (done % 100 == 0 || done == total) {
                 eprint!("\r  [{label}] Progress: {done}/{total} blocks");
             }
@@ -115,6 +120,8 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         allowed_rpcs: cfg.allowed_rpcs.clone(),
         last_scanned_height: RwLock::new(chain_height),
         hash_cache: RwLock::new(api::HashCache::new(1000)),
+        block_cache,
+        chain_height: AtomicU32::new(chain_height),
     }))
 }
 
@@ -132,6 +139,9 @@ fn build_routes(state: Arc<api::AppState>) -> Router {
 }
 
 /// Scan for new blocks and index them. Shared by both ZMQ and polling.
+///
+/// Detects chain reorganizations by verifying the parent hash chain.
+/// On reorg, walks back to the fork point and invalidates cached blocks.
 fn index_new_blocks(
     label: &'static str,
     rpc_url: &str,
@@ -151,6 +161,9 @@ fn index_new_blocks(
         }
     };
 
+    // Update global chain height (used for rehydration)
+    state.chain_height.store(chain_height, Ordering::Relaxed);
+
     let rt = tokio::runtime::Handle::current();
     let last_scanned = rt.block_on(async { *state.last_scanned_height.read().await });
 
@@ -159,7 +172,35 @@ fn index_new_blocks(
         return;
     }
 
-    match scanner::scan_range(&rpc, scan_from, chain_height, |_, _| {}) {
+    // --- Reorg detection ---
+    if let Ok(new_hash) = rpc.get_block_hash(scan_from) {
+        if let Ok(new_block) = rpc.get_block(&new_hash, 1) {
+            if let Some(prev_hash) = new_block.get("previousblockhash").and_then(|v| v.as_str()) {
+                let reorged = state.block_cache.read().unwrap().detect_reorg(scan_from, prev_hash);
+                if reorged {
+                    let fork_height = find_fork_point(&rpc, &state.block_cache, scan_from);
+                    eprintln!("  [{label}] {source}: reorg detected! Fork at height {fork_height}");
+                    state.block_cache.write().unwrap().invalidate_from(fork_height);
+
+                    rt.block_on(async {
+                        let mut index = state.index.write().await;
+                        index.remove_from(fork_height);
+                        let _ = index.save(index_path);
+                        *state.last_scanned_height.write().await = fork_height.saturating_sub(1);
+                    });
+                }
+            }
+        }
+    }
+
+    // Re-read last_scanned (may have changed from reorg handling)
+    let last_scanned = rt.block_on(async { *state.last_scanned_height.read().await });
+    let scan_from = last_scanned + 1;
+    if scan_from > chain_height {
+        return;
+    }
+
+    match scanner::scan_range(&rpc, scan_from, chain_height, &state.block_cache, chain_height, |_, _| {}) {
         Ok(blocks) => {
             let count = blocks.len();
             let new_bytes = stream::encode_shield_stream(
@@ -192,7 +233,6 @@ fn index_new_blocks(
                     eprintln!("  [{label}] Index save failed: {e}");
                 }
 
-                // Update last scanned height
                 *state.last_scanned_height.write().await = chain_height;
             });
             if count > 0 {
@@ -203,6 +243,33 @@ fn index_new_blocks(
             eprintln!("  [{label}] {source} scan error: {e}");
         }
     }
+}
+
+/// Walk backwards from `height` to find where the chain diverges from cache.
+fn find_fork_point(
+    rpc: &rpc::RpcClient,
+    block_cache: &std::sync::RwLock<block_cache::BlockCache>,
+    height: u32,
+) -> u32 {
+    let cache = block_cache.read().unwrap();
+    let mut h = height.saturating_sub(1);
+    let limit = height.saturating_sub(100);
+
+    while h > limit {
+        match cache.hash_for_height(h) {
+            Some(cached_hash) => {
+                if let Ok(node_hash) = rpc.get_block_hash(h) {
+                    if node_hash == cached_hash {
+                        return h + 1;
+                    }
+                }
+                h -= 1;
+            }
+            None => return h + 1,
+        }
+    }
+
+    h + 1
 }
 
 /// Spawn ZMQ listener — instant block notifications when it works.
