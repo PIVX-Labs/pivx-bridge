@@ -69,7 +69,7 @@ pub async fn rpc_proxy(
                 // Apply jq filter if present, then return
                 let filtered = match &query.filter {
                     Some(expr) if !expr.is_empty() => {
-                        apply_jq_system(&json, expr)
+                        apply_jq(&json, expr)
                             .map_err(|e| (StatusCode::BAD_REQUEST, format!("jq filter error: {e}")))?
                     }
                     _ => json,
@@ -113,7 +113,7 @@ pub async fn rpc_proxy(
             if expr.len() > 10_000 {
                 return Err((StatusCode::BAD_REQUEST, "filter expression too long".into()));
             }
-            apply_jq_system(&result, expr)
+            apply_jq(&result, expr)
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("jq filter error: {e}")))?
         }
         _ => result,
@@ -187,46 +187,52 @@ fn parse_params(raw: &str) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal jq evaluator — covers the subset MPW actually uses
+// Inline jq filter — pure Rust via jaq (no process fork)
 // ---------------------------------------------------------------------------
 
-/// Apply a jq filter by shelling out to the system `jq` binary.
+/// Apply a jq filter expression to a JSON value using jaq (pure Rust).
 ///
-/// This gives 100% jq compatibility — same as PivxNodeController's `node-jq`.
-fn apply_jq_system(value: &Value, expr: &str) -> Result<Value, String> {
-    let input = serde_json::to_string(value).map_err(|e| e.to_string())?;
+/// Replaces the previous system `jq` binary approach — eliminates ~90ms
+/// process spawn overhead per request.
+fn apply_jq(value: &Value, expr: &str) -> Result<Value, String> {
+    use jaq_core::load::{Arena, File, Loader};
+    use jaq_core::{Compiler, Ctx, Vars};
 
-    let output = std::process::Command::new("jq")
-        .arg("-c")
-        .arg(expr)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child.stdin.take().unwrap().write_all(input.as_bytes())?;
-            child.wait_with_output()
-        })
-        .map_err(|e| format!("jq execution failed: {e}"))?;
+    // Parse input: serde_json::Value → string → jaq Val
+    let input_str = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    let input = jaq_json::read::parse_single(input_str.as_bytes())
+        .map_err(|e| format!("jq input: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("jq error: {}", stderr.trim()));
-    }
+    // Compile filter
+    let program = File { code: expr, path: () };
+    let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
+    type D = jaq_core::data::JustLut<jaq_json::Val>;
+    let funs = jaq_core::funs::<D>().chain(jaq_std::funs()).chain(jaq_json::funs());
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let trimmed = stdout.trim();
+    let loader = Loader::new(defs);
+    let arena = Arena::default();
+    let modules = loader.load(&arena, program)
+        .map_err(|errs| format!("jq parse: {errs:?}"))?;
+    let filter = Compiler::default()
+        .with_funs(funs)
+        .compile(modules)
+        .map_err(|errs| format!("jq compile: {errs:?}"))?;
 
-    // jq may output multiple lines (one per result) — collect as array
-    let lines: Vec<&str> = trimmed.lines().collect();
-    if lines.len() == 1 {
-        serde_json::from_str(lines[0]).map_err(|e| format!("jq output parse error: {e}"))
+    // Run filter
+    let ctx: Ctx<'_, D> = Ctx::new(&filter.lut, Vars::new([]));
+    let results: Vec<jaq_json::Val> = filter.id.run((ctx, input))
+        .map(|r| r.map_err(|e| format!("jq eval: {e:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Convert results: jaq Val → string → serde_json::Value
+    if results.len() == 1 {
+        let s = results[0].to_string();
+        serde_json::from_str(&s).map_err(|e| format!("jq output: {e}"))
     } else {
-        let values: Result<Vec<Value>, _> = lines.iter()
-            .map(|line| serde_json::from_str(line))
+        let values: Result<Vec<Value>, _> = results.iter()
+            .map(|v| serde_json::from_str(&v.to_string()))
             .collect();
-        Ok(Value::Array(values.map_err(|e| format!("jq output parse error: {e}"))?))
+        Ok(Value::Array(values.map_err(|e| format!("jq output: {e}"))?))
     }
 }
 
@@ -252,39 +258,39 @@ mod tests {
     #[test]
     fn jq_identity() {
         let v = json!({"a": 1});
-        assert_eq!(apply_jq_system(&v, ".").unwrap(), v);
+        assert_eq!(apply_jq(&v, ".").unwrap(), v);
     }
 
     #[test]
     fn jq_field_access() {
         let v = json!({"name": "test", "value": 42});
-        assert_eq!(apply_jq_system(&v, ".name").unwrap(), json!("test"));
-        assert_eq!(apply_jq_system(&v, ".value").unwrap(), json!(42));
+        assert_eq!(apply_jq(&v, ".name").unwrap(), json!("test"));
+        assert_eq!(apply_jq(&v, ".value").unwrap(), json!(42));
     }
 
     #[test]
     fn jq_nested_field() {
         let v = json!({"a": {"b": {"c": 99}}});
-        assert_eq!(apply_jq_system(&v, ".a.b.c").unwrap(), json!(99));
+        assert_eq!(apply_jq(&v, ".a.b.c").unwrap(), json!(99));
     }
 
     #[test]
     fn jq_pipe() {
         let v = json!({"data": [1, 2, 3]});
-        assert_eq!(apply_jq_system(&v, ".data | .[]").unwrap(), json!([1, 2, 3]));
+        assert_eq!(apply_jq(&v, ".data | .[]").unwrap(), json!([1, 2, 3]));
     }
 
     #[test]
     fn jq_object_construction() {
         let v = json!({"name": "Alice", "age": 30, "extra": "skip"});
-        assert_eq!(apply_jq_system(&v, "{name, age}").unwrap(), json!({"name": "Alice", "age": 30}));
+        assert_eq!(apply_jq(&v, "{name, age}").unwrap(), json!({"name": "Alice", "age": 30}));
     }
 
     #[test]
     fn jq_complex_assignment() {
         // The expression MPW actually uses
         let v = json!({"tx": [{"hex": "abc", "txid": "123", "extra": true}]});
-        let result = apply_jq_system(&v, ". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)").unwrap();
+        let result = apply_jq(&v, ". | .txs = [.tx[] | { hex: .hex, txid: .txid}] | del(.tx)").unwrap();
         assert_eq!(result, json!({"txs": [{"hex": "abc", "txid": "123"}]}));
     }
 }

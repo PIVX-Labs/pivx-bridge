@@ -28,3 +28,8 @@ futures = "0.3"
 
 # Utilities
 sha2 = "0.10"
+
+# Inline jq filter — pure Rust, no process fork
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = "2"
