@@ -115,7 +115,7 @@ pub async fn get_shield_data(
 ) -> Result<Response, (StatusCode, String)> {
     let start = query.start_block.unwrap_or(0);
     let format = query.format;
-    eprintln!("  [shielddata] Request startBlock={start} format={format:?}");
+    let timer = std::time::Instant::now();
 
     // For PIVX-compat format, serve directly from in-memory buffer
     if format == StreamFormat::PivxCompat {
@@ -135,6 +135,7 @@ pub async fn get_shield_data(
         // Single allocation: copy the slice into the response
         let data = buffer[offset..].to_vec();
         drop(buffer); // release read lock before sending
+        crate::proxy::log_timing(timer, "getshielddata");
         return Ok(build_binary_response(data));
     }
 

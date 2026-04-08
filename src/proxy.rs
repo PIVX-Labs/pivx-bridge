@@ -33,15 +33,16 @@ pub async fn rpc_proxy(
 
     // Parse params with type coercion (PivxNodeController compat)
     let params = parse_params(query.params.as_deref().unwrap_or(""));
-
-    eprintln!("  [proxy] {method}({params:?})");
+    let start = std::time::Instant::now();
 
     // Fast path: serve getblockhash from cache
     if method == "getblockhash" {
         if let Some(height) = params.first().and_then(|v| v.as_u64()).map(|h| h as u32) {
             let cache = state.hash_cache.read().await;
             if let Some(hash) = cache.get(height) {
-                return Ok(Json(Value::String(hash.to_string())));
+                let result = Json(Value::String(hash.to_string()));
+                log_timing(start, &method);
+                return Ok(result);
             }
         }
     }
@@ -79,7 +80,23 @@ pub async fn rpc_proxy(
         _ => result,
     };
 
+    log_timing(start, &method);
     Ok(Json(filtered))
+}
+
+/// Write elapsed time directly to stderr — no allocation.
+pub fn log_timing(start: std::time::Instant, label: &str) {
+    use std::io::Write;
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    let stderr = std::io::stderr();
+    let mut w = stderr.lock();
+    if ms >= 1000.0 {
+        let _ = writeln!(w, "  [proxy {:.1}s] {label}", ms / 1000.0);
+    } else if ms >= 1.0 {
+        let _ = writeln!(w, "  [proxy {:.0}ms] {label}", ms);
+    } else {
+        let _ = writeln!(w, "  [proxy {:.2}ms] {label}", ms);
+    }
 }
 
 /// Parse comma-separated params with PivxNodeController-style type coercion.
