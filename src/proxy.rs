@@ -49,7 +49,17 @@ pub async fn rpc_proxy(
 
     // Fast path: serve getblock from block cache (only when no jq filter)
     if method == "getblock" && query.filter.as_ref().is_none_or(|f| f.is_empty()) {
-        if let Some(hash) = params.first().and_then(|v| v.as_str()) {
+        // First param can be a hash (string) or height (number) — resolve to hash
+        let block_hash = if let Some(hash) = params.first().and_then(|v| v.as_str()) {
+            Some(hash.to_string())
+        } else if let Some(height) = params.first().and_then(|v| v.as_u64()).map(|h| h as u32) {
+            let cache = state.block_cache.read().unwrap();
+            cache.hash_for_height(height).map(String::from)
+        } else {
+            None
+        };
+
+        if let Some(hash) = &block_hash {
             let verbosity = params.get(1)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u8;
