@@ -265,10 +265,11 @@ fn parse_sapling_tx(data: &[u8]) -> Result<Option<CompactTx>, String> {
         return Ok(None);
     }
 
-    // PIVX Sapling fields follow directly (no payload wrapper):
-    // valueBalance (8 bytes)
+    // PIVX Sapling fields:
+    // sapVersion (1 byte) + valueBalance (8 bytes) + spends + outputs + [bindingSig]
+    pos += 1; // sapVersion
     if pos + 8 > data.len() { return Ok(None); }
-    pos += 8; // skip valueBalance
+    pos += 8; // valueBalance
 
     // Parse spend and output descriptions
     parse_sapling_descs(data, pos)
@@ -465,12 +466,13 @@ mod tests {
 
     #[test]
     fn parse_sapling_tx_empty_shield() {
-        // PIVX format with valueBalance but 0 spends and 0 outputs
+        // PIVX format: version + vin(0) + vout(0) + nLockTime + sapVersion + valueBalance + 0 spends + 0 outputs
         let mut tx = Vec::new();
         tx.extend_from_slice(&SAPLING_VERSION);
         tx.push(0); // vin = 0
         tx.push(0); // vout = 0
         tx.extend([0u8; 4]); // nLockTime
+        tx.push(1); // sapVersion
         tx.extend([0u8; 8]); // valueBalance = 0
         tx.push(0); // num_spends = 0
         tx.push(0); // num_outputs = 0
