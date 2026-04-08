@@ -98,11 +98,11 @@ fn encode_block_header(stream: &mut Vec<u8>, height: u32) {
     stream.extend(height.to_le_bytes());
 }
 
-/// Encode a compact transaction (0x04) with out_ciphertext.
+/// Encode a compact transaction (0x04) with cv + out_ciphertext for sender recovery.
 fn encode_compact_tx(stream: &mut Vec<u8>, compact: &crate::scanner::CompactTx, _raw: &[u8]) {
     let payload_len = 1 + 2
         + compact.nullifiers.len() * 32
-        + compact.outputs.len() * (32 + 32 + ENC_CT_SIZE + OUT_CT_SIZE);
+        + compact.outputs.len() * (32 + 32 + 32 + ENC_CT_SIZE + OUT_CT_SIZE);
 
     let mut payload = Vec::with_capacity(payload_len);
     payload.push(PACKET_TYPE_COMPACT_TX);
@@ -114,6 +114,7 @@ fn encode_compact_tx(stream: &mut Vec<u8>, compact: &crate::scanner::CompactTx, 
     }
 
     for out in &compact.outputs {
+        payload.extend_from_slice(&out.cv);
         payload.extend_from_slice(&out.cmu);
         payload.extend_from_slice(&out.epk);
         payload.extend_from_slice(&out.enc_ciphertext);
@@ -286,6 +287,7 @@ mod tests {
         let compact = CompactTx {
             nullifiers: vec![[0xAA; 32]],
             outputs: vec![CompactOutput {
+                cv: [0u8; 32],
                 cmu: [1u8; 32],
                 epk: [2u8; 32],
                 enc_ciphertext: [3u8; 580],
@@ -310,8 +312,8 @@ mod tests {
         assert_eq!(stream[pos+4], 0x04); // compact type
         assert_eq!(stream[pos+5], 1);    // 1 spend
         assert_eq!(stream[pos+6], 1);    // 1 output
-        // Total: 1 (type) + 2 (counts) + 32 (nullifier) + 32+32+580+80 (output) = 759
-        assert_eq!(tx_len, 759);
+        // Total: 1 (type) + 2 (counts) + 32 (nullifier) + 32+32+32+580+80 (output) = 791
+        assert_eq!(tx_len, 791);
     }
 
     #[test]
@@ -319,6 +321,7 @@ mod tests {
         let compact = CompactTx {
             nullifiers: vec![],
             outputs: vec![CompactOutput {
+                cv: [0u8; 32],
                 cmu: [1u8; 32],
                 epk: [2u8; 32],
                 enc_ciphertext: [3u8; 580],
@@ -332,10 +335,10 @@ mod tests {
         let compact_stream = encode_shield_stream(&[block.clone()], StreamFormat::Compact);
         let plus_stream = encode_shield_stream(&[block], StreamFormat::CompactPlus);
 
-        // CompactPlus should be smaller (no out_ciphertext: -80 bytes per output)
+        // CompactPlus should be smaller (no cv or out_ciphertext: -112 bytes per output)
         assert!(plus_stream.len() < compact_stream.len());
         let diff = compact_stream.len() - plus_stream.len();
-        assert_eq!(diff, 80); // exactly one output's out_ciphertext
+        assert_eq!(diff, 112); // cv(32) + out_ciphertext(80) stripped
 
         // CompactPlus type byte should be 0x05
         // Skip header (9 bytes), then length prefix (4), then type byte
@@ -346,10 +349,10 @@ mod tests {
     fn compact_output_size_math() {
         // Verify the documented size savings
         let full_output = 32 + 32 + 32 + 580 + 80 + 192; // 948
-        let compact_output = 32 + 32 + 580 + 80; // 724
-        let compact_plus_output = 32 + 32 + 580; // 644
+        let compact_output = 32 + 32 + 32 + 580 + 80; // 756 (cv + cmu + epk + enc + out_ct)
+        let compact_plus_output = 32 + 32 + 580; // 644 (cmu + epk + enc only)
         assert_eq!(full_output, 948);
-        assert_eq!(compact_output, 724);
+        assert_eq!(compact_output, 756);
         assert_eq!(compact_plus_output, 644);
     }
 }

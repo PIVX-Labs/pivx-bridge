@@ -55,6 +55,8 @@ pub struct CompactTx {
 /// A compact Sapling output.
 #[derive(Debug, Clone)]
 pub struct CompactOutput {
+    /// Value commitment (32 bytes) — needed for OVK outgoing recovery.
+    pub cv: [u8; 32],
     /// Note commitment (32 bytes).
     pub cmu: [u8; 32],
     /// Ephemeral public key (32 bytes).
@@ -279,6 +281,9 @@ fn parse_sapling_payload(data: &[u8]) -> Result<Option<CompactTx>, String> {
     for _ in 0..num_outputs {
         if pos + OUTPUT_DESC_SIZE > data.len() { return Err("truncated output".into()); }
         // cv(32) + cmu(32) + epk(32) + enc(580) + out(80) + proof(192)
+        let mut cv = [0u8; 32];
+        cv.copy_from_slice(&data[pos..pos + 32]);
+
         let mut cmu = [0u8; 32];
         cmu.copy_from_slice(&data[pos + 32..pos + 64]);
 
@@ -291,7 +296,7 @@ fn parse_sapling_payload(data: &[u8]) -> Result<Option<CompactTx>, String> {
         let mut out_ciphertext = [0u8; OUT_CIPHERTEXT_SIZE];
         out_ciphertext.copy_from_slice(&data[pos + 96 + ENC_CIPHERTEXT_SIZE..pos + 96 + ENC_CIPHERTEXT_SIZE + OUT_CIPHERTEXT_SIZE]);
 
-        outputs.push(CompactOutput { cmu, epk, enc_ciphertext, out_ciphertext });
+        outputs.push(CompactOutput { cv, cmu, epk, enc_ciphertext, out_ciphertext });
         pos += OUTPUT_DESC_SIZE;
     }
 
