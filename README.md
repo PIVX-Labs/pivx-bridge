@@ -27,7 +27,8 @@ Benchmarked head-to-head against PivxNodeController on the same production serve
 - **In-memory shield buffer** — the entire shield dataset (~200MB) is held in RAM. Requests serve a memory slice directly — zero disk I/O, zero file handle contention
 - **Binary search indexing** — block lookups in O(log n) instead of linear scan. 17 comparisons for 34,000 shield blocks
 - **Inline tx extraction** — `getblock` verbosity 2 returns tx hex inline, eliminating a separate RPC call per transaction. 100x fewer RPC calls during chain scan
-- **ZMQ block notifications** — new shield transactions are indexed instantly on block arrival, not discovered 60 seconds later by a polling loop
+- **ZMQ + polling** — new blocks indexed instantly via ZMQ hashblock notifications, with a 10s polling safety net that catches anything ZMQ misses
+- **Block hash LRU cache** — the last 1,000 height→hash mappings are cached in memory. `getblockhash` proxy calls serve from cache in <0.01ms instead of ~1ms RPC round-trips. On production traffic, ~50% of proxy calls are cache hits
 - **Opt-in compact formats** — strip Groth16 proofs and signatures that light wallets never verify, cutting sync data by 24-42%
 
 ## Quick Start
@@ -126,15 +127,15 @@ CompactPlus (opt-in):
 
 ```
 src/
-  main.rs       Startup, initial scan, ZMQ subscriber, axum server
+  main.rs       Startup, initial scan, ZMQ + polling subscribers, axum server
   config.rs     CLI args + .env configuration
   rpc.rs        JSON-RPC 1.0 client with auth + connection pooling + 30s timeout
-  scanner.rs    Block scanner + PIVX type 10 Sapling tx parser (verbosity 2)
+  scanner.rs    Block scanner + PIVX v3 Sapling tx parser (validated against PIVX Core)
   stream.rs     Binary stream encoder (PivxCompat / Compact / CompactPlus)
   cache.rs      Persistent shield.bin cache with crash recovery
   index.rs      Binary search index with byte offsets (shield.json compat)
-  api.rs        HTTP endpoints with in-memory buffer serving
-  proxy.rs      RPC proxy with system jq filtering
+  api.rs        HTTP endpoints with in-memory buffer serving + block hash LRU cache
+  proxy.rs      RPC proxy with system jq filtering + response timing
 ```
 
 ## Configuration
@@ -166,7 +167,7 @@ On startup, `shield.bin` is validated and truncated to the last complete block f
 ## Testing
 
 ```bash
-cargo test    # 40 tests
+cargo test    # 44 tests (includes real mainnet tx validation)
 cargo clippy  # Zero warnings
 ```
 
