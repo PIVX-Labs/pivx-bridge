@@ -35,6 +35,8 @@ pub struct AppState {
     pub block_cache: std::sync::RwLock<BlockCache>,
     /// Current chain height — updated by ZMQ/polling, used for rehydration.
     pub chain_height: AtomicU32,
+    /// True when ZMQ is connected and receiving blocks. Polling is disabled.
+    pub zmq_active: std::sync::atomic::AtomicBool,
 }
 
 /// Fixed-size LRU cache for block height → hash mappings.

@@ -123,6 +123,7 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         hash_cache: RwLock::new(api::HashCache::new(1000)),
         block_cache,
         chain_height: AtomicU32::new(chain_height),
+        zmq_active: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -207,24 +208,29 @@ fn index_new_blocks(
 
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
-                // Re-check last_scanned under lock to prevent ZMQ+poll race
-                let already_scanned = *state.last_scanned_height.read().await;
+                // Filter against the index to prevent ZMQ+poll race appending
+                // the same shield block twice. The index is the source of truth.
+                let index = state.index.read().await;
                 let new_blocks: Vec<_> = blocks.iter()
-                    .filter(|b| b.height > already_scanned)
+                    .filter(|b| !index.shield_heights.contains(&b.height))
                     .collect();
+                drop(index);
 
                 if new_blocks.is_empty() {
+                    *state.last_scanned_height.write().await = chain_height;
                     return;
                 }
 
+                let new_blocks_owned: Vec<_> = new_blocks.iter().map(|b| (*b).clone()).collect();
+
                 let new_bytes = stream::encode_shield_stream(
-                    &new_blocks.iter().map(|b| (*b).clone()).collect::<Vec<_>>(),
+                    &new_blocks_owned,
                     api::StreamFormat::PivxCompat,
                 );
 
                 let cache_entries = {
                     let mut file = state.cache_file.lock().await;
-                    cache::append_blocks(&mut file, &new_blocks.iter().map(|b| (*b).clone()).collect::<Vec<_>>()).ok()
+                    cache::append_blocks(&mut file, &new_blocks_owned).ok()
                 };
 
                 {
@@ -302,11 +308,13 @@ fn spawn_zmq_listener(
             eprintln!("  [{label}] ZMQ subscribing to {zmq_url}...");
             let mut subscriber = match bitcoincore_zmq::subscribe_async(&[&zmq_url]) {
                 Ok(s) => {
-                    eprintln!("  [{label}] ZMQ connected");
+                    eprintln!("  [{label}] ZMQ connected — polling disabled");
+                    state.zmq_active.store(true, std::sync::atomic::Ordering::Relaxed);
                     s
                 }
                 Err(e) => {
-                    eprintln!("  [{label}] ZMQ failed: {e} — retrying in 30s");
+                    state.zmq_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("  [{label}] ZMQ failed: {e} — polling re-enabled, retrying in 30s");
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     continue;
                 }
@@ -316,7 +324,8 @@ fn spawn_zmq_listener(
                 let msg = match msg {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("  [{label}] ZMQ error: {e} — reconnecting");
+                        state.zmq_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("  [{label}] ZMQ error: {e} — polling re-enabled, reconnecting");
                         break;
                     }
                 };
@@ -349,9 +358,14 @@ fn spawn_poller(
     index_path: String,
 ) {
     tokio::spawn(async move {
-        eprintln!("  [{label}] Polling active (10s interval)");
+        eprintln!("  [{label}] Polling standby (10s interval, active when ZMQ is down)");
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+            // Skip polling entirely when ZMQ is connected
+            if state.zmq_active.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
 
             let last_scanned = *state.last_scanned_height.read().await;
 
