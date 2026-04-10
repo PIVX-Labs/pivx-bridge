@@ -204,15 +204,27 @@ fn index_new_blocks(
     match scanner::scan_range(&rpc, scan_from, chain_height, &state.block_cache, chain_height, |_, _| {}) {
         Ok(blocks) => {
             let count = blocks.len();
-            let new_bytes = stream::encode_shield_stream(
-                &blocks, api::StreamFormat::PivxCompat,
-            );
 
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
+                // Re-check last_scanned under lock to prevent ZMQ+poll race
+                let already_scanned = *state.last_scanned_height.read().await;
+                let new_blocks: Vec<_> = blocks.iter()
+                    .filter(|b| b.height > already_scanned)
+                    .collect();
+
+                if new_blocks.is_empty() {
+                    return;
+                }
+
+                let new_bytes = stream::encode_shield_stream(
+                    &new_blocks.iter().map(|b| (*b).clone()).collect::<Vec<_>>(),
+                    api::StreamFormat::PivxCompat,
+                );
+
                 let cache_entries = {
                     let mut file = state.cache_file.lock().await;
-                    cache::append_blocks(&mut file, &blocks).ok()
+                    cache::append_blocks(&mut file, &new_blocks.iter().map(|b| (*b).clone()).collect::<Vec<_>>()).ok()
                 };
 
                 {
@@ -226,7 +238,7 @@ fn index_new_blocks(
                         index.add(height, offset);
                     }
                 } else {
-                    for block in &blocks {
+                    for block in &new_blocks {
                         index.add(block.height, 0);
                     }
                 }
