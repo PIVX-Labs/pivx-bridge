@@ -312,7 +312,7 @@ pub fn scan_range(
 ///
 /// The discriminant is the Optional<SaplingTxData> presence flag from PIVX's serialize.h.
 /// Kerrigan/Dash uses nType=10 with an extra payload wrapper instead.
-fn parse_sapling_tx(data: &[u8]) -> Result<Option<CompactTx>, String> {
+pub fn parse_sapling_tx(data: &[u8]) -> Result<Option<CompactTx>, String> {
     let mut pos = 4; // skip version header
 
     // Skip vin
