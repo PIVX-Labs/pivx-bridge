@@ -21,14 +21,17 @@ impl RpcClient {
         }
     }
 
+    #[allow(dead_code)]
     pub fn url(&self) -> &str {
         &self.url
     }
 
+    #[allow(dead_code)]
     pub fn user(&self) -> &str {
         &self.user
     }
 
+    #[allow(dead_code)]
     pub fn pass(&self) -> &str {
         &self.pass
     }

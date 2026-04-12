@@ -178,6 +178,7 @@ fn scan_block_inner(
 }
 
 /// Scan a single block by height, using the block cache.
+    #[allow(dead_code)]
 pub fn scan_block(
     rpc: &RpcClient,
     height: u32,
