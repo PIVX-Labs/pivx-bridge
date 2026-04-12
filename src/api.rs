@@ -183,10 +183,14 @@ pub struct ShieldDataLengthQuery {
     pub start_block: Option<u32>,
     #[serde(rename = "endBlock")]
     pub end_block: Option<u32>,
+    #[serde(default)]
+    pub format: StreamFormat,
 }
 
 /// Return the byte count of shield data between two block heights.
 ///
+/// Accepts an optional `format` parameter to return the accurate size
+/// for compact or compact+ streams (derived from the PivxCompat buffer).
 /// Used by MPW for sync progress bars.
 pub async fn get_shield_data_length(
     State(state): State<Arc<AppState>>,
@@ -194,11 +198,27 @@ pub async fn get_shield_data_length(
 ) -> Result<String, (StatusCode, String)> {
     let start = query.start_block.unwrap_or(0);
     let end = query.end_block.unwrap_or(u32::MAX);
-    let buffer_len = state.shield_buffer.read().await.len() as u64;
+    let buffer = state.shield_buffer.read().await;
+    let buffer_len = buffer.len() as u64;
 
-    let length = {
+    let length = if query.format == StreamFormat::PivxCompat {
         let index = state.index.read().await;
         index.byte_length_between(start, end, buffer_len)
+    } else {
+        // Compute exact size by deriving the compact stream for the range
+        let index = state.index.read().await;
+        let start_off = index.offset_for_height(start).unwrap_or(buffer_len) as usize;
+        let end_off = index.entries.iter()
+            .find(|e| e.block > end)
+            .map(|e| e.i as usize)
+            .unwrap_or(buffer.len());
+        drop(index);
+
+        if start_off >= buffer.len() || start_off >= end_off {
+            0
+        } else {
+            pivxcompat_to_compact(&buffer[start_off..end_off], query.format).len() as u64
+        }
     };
 
     Ok(length.to_string())
