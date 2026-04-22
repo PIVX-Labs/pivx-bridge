@@ -35,6 +35,12 @@ pub struct AppState {
     pub chain_height: AtomicU32,
     /// True when ZMQ is connected and receiving blocks. Polling is disabled.
     pub zmq_active: std::sync::atomic::AtomicBool,
+    /// Mutual-exclusion gate on `index_new_blocks`. When true, another
+    /// indexing pass is in flight; concurrent callers return early to
+    /// prevent double-appending the same block(s) into the shield stream
+    /// (the classic ZMQ+poll race that produced duplicate blocks on
+    /// rpc.pivxla.bz — see PIVX-Labs/pivx-bridge#1).
+    pub indexing: std::sync::atomic::AtomicBool,
 }
 
 /// Fixed-size LRU cache for block height → hash mappings.

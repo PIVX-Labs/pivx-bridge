@@ -124,6 +124,7 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         block_cache,
         chain_height: AtomicU32::new(chain_height),
         zmq_active: std::sync::atomic::AtomicBool::new(false),
+        indexing: std::sync::atomic::AtomicBool::new(false),
     }))
 }
 
@@ -153,6 +154,31 @@ fn index_new_blocks(
     index_path: &str,
     source: &str,
 ) {
+    // Mutual-exclusion gate: ZMQ and poll can both fire at the same tip,
+    // and the filter-then-append critical section below is not atomic —
+    // the shield_heights check and the shield.bin/buffer append happen as
+    // separate awaits. Without this gate, two concurrent entries both pass
+    // the filter (because neither has committed its append yet) and both
+    // write the block, producing the duplicate-block-in-stream that
+    // PIVX-Labs/pivx-bridge#1 reports. If someone else is already indexing,
+    // just return — the winner will cover whatever we would have done.
+    if state.indexing.compare_exchange(
+        false,
+        true,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ).is_err() {
+        return;
+    }
+    // RAII guard so the flag is released on every exit path.
+    struct IndexingGuard<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for IndexingGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = IndexingGuard(&state.indexing);
+
     let rpc = rpc::RpcClient::new(rpc_url, rpc_user, rpc_pass);
 
     let chain_height = match rpc.get_block_count() {
@@ -202,65 +228,108 @@ fn index_new_blocks(
         return;
     }
 
-    match scanner::scan_range(&rpc, scan_from, chain_height, &state.block_cache, chain_height, |_, _| {}) {
-        Ok(blocks) => {
-            let count = blocks.len();
+    // One-block-at-a-time indexer loop. Invariant: `last_scanned_height`
+    // ONLY advances after scan_block returns Ok for block `last_scanned + 1`.
+    // On Err we break and return — the next poll tick (or ZMQ event) will
+    // re-enter and retry the exact same block. No skipping, no advancing
+    // past a block we couldn't process. See feedback_indexer_never_skip.md
+    // for the incident on the Kerrigan bridge that motivated this fix; the
+    // same bug pattern existed here and is fixed in parallel.
+    let mut indexed_count: u32 = 0;
+    let mut needs_persist = false;
+    loop {
+        let target_h = {
+            let cursor = rt.block_on(async { *state.last_scanned_height.read().await });
+            cursor + 1
+        };
+        if target_h > chain_height {
+            break;
+        }
 
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                // Filter against the index to prevent ZMQ+poll race appending
-                // the same shield block twice. The index is the source of truth.
-                let index = state.index.read().await;
-                let new_blocks: Vec<_> = blocks.iter()
-                    .filter(|b| !index.shield_heights.contains(&b.height))
-                    .collect();
-                drop(index);
-
-                if new_blocks.is_empty() {
-                    *state.last_scanned_height.write().await = chain_height;
-                    return;
-                }
-
-                let new_blocks_owned: Vec<_> = new_blocks.iter().map(|b| (*b).clone()).collect();
-
-                let new_bytes = stream::encode_shield_stream(
-                    &new_blocks_owned,
-                    api::StreamFormat::PivxCompat,
-                );
-
-                let cache_entries = {
-                    let mut file = state.cache_file.lock().await;
-                    cache::append_blocks(&mut file, &new_blocks_owned).ok()
-                };
-
-                {
-                    let mut buffer = state.shield_buffer.write().await;
-                    buffer.extend_from_slice(&new_bytes);
-                }
-
-                let mut index = state.index.write().await;
-                if let Some(entries) = cache_entries {
-                    for (height, offset, _len) in entries {
-                        index.add(height, offset);
+        match scanner::scan_block(&rpc, target_h, &state.block_cache, chain_height) {
+            Ok(Some(block)) => {
+                let appended = rt.block_on(async {
+                    // Idempotency belt-and-suspenders: if this height is
+                    // already indexed (rare — ZMQ+poll overlap), skip
+                    // the append but still advance past it.
+                    {
+                        let idx = state.index.read().await;
+                        if idx.shield_heights.contains(&block.height) {
+                            return true;
+                        }
                     }
-                } else {
-                    for block in &new_blocks {
+
+                    let block_slice = std::slice::from_ref(&block);
+                    let new_bytes = stream::encode_shield_stream(
+                        block_slice,
+                        api::StreamFormat::PivxCompat,
+                    );
+
+                    let cache_entries = {
+                        let mut file = state.cache_file.lock().await;
+                        cache::append_blocks(&mut file, block_slice).ok()
+                    };
+
+                    {
+                        let mut buffer = state.shield_buffer.write().await;
+                        buffer.extend_from_slice(&new_bytes);
+                    }
+
+                    let mut index = state.index.write().await;
+                    if let Some(entries) = cache_entries {
+                        for (height, offset, _len) in entries {
+                            index.add(height, offset);
+                        }
+                    } else {
                         index.add(block.height, 0);
                     }
-                }
-                if let Err(e) = index.save(index_path) {
-                    eprintln!("  [{label}] Index save failed: {e}");
+                    if let Err(e) = index.save(index_path) {
+                        eprintln!("  [{label}] Index save failed: {e}");
+                    }
+                    true
+                });
+                if !appended {
+                    eprintln!("  [{label}] {source}: block {target_h} append failed, will retry");
+                    break;
                 }
 
-                *state.last_scanned_height.write().await = chain_height;
-            });
-            if count > 0 {
-                eprintln!("  [{label}] {source}: indexed {count} new shield block(s) (chain: {chain_height})");
+                // Advance cursor — the only place it moves after a shield block.
+                rt.block_on(async {
+                    *state.last_scanned_height.write().await = target_h;
+                });
+                needs_persist = false;
+                indexed_count += 1;
+                eprintln!("  [{label}] {source}: indexed shield block {target_h} (chain: {chain_height})");
+            }
+            Ok(None) => {
+                // No shield data in this block — successful scan, advance
+                // cursor in memory. Batch-persist at loop exit to avoid
+                // a disk write per empty block during catch-up.
+                rt.block_on(async {
+                    *state.last_scanned_height.write().await = target_h;
+                });
+                needs_persist = true;
+            }
+            Err(e) => {
+                // Transient (or persistent) scan failure. Do NOT advance —
+                // next tick will retry this exact height.
+                eprintln!("  [{label}] {source}: block {target_h} scan failed: {e} — will retry");
+                break;
             }
         }
-        Err(e) => {
-            eprintln!("  [{label}] {source} scan error: {e}");
-        }
+    }
+
+    if needs_persist {
+        rt.block_on(async {
+            let index = state.index.read().await;
+            if let Err(e) = index.save(index_path) {
+                eprintln!("  [{label}] Index save failed: {e}");
+            }
+        });
+    }
+
+    if indexed_count > 0 {
+        eprintln!("  [{label}] {source}: catch-up complete ({indexed_count} shield block(s) this pass)");
     }
 }
 
