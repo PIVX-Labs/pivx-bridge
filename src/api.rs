@@ -48,12 +48,6 @@ pub struct AppState {
     /// (the classic ZMQ+poll race that produced duplicate blocks on
     /// rpc.pivxla.bz — see PIVX-Labs/pivx-bridge#1).
     pub indexing: std::sync::atomic::AtomicBool,
-    /// Path to `shield.bin` on disk. Stored on state so the reorg
-    /// handler (which needs to truncate the file) doesn't need it
-    /// threaded through every call site.
-    pub cache_path: String,
-    /// Path to `shield_index.json`.
-    pub index_path: String,
     /// Path to the scan-cursor sidecar (`shield_cursor.json` or
     /// `shield_cursor.testnet.json`). Saved atomically alongside the
     /// index after every successful append + reorg.

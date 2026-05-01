@@ -206,8 +206,6 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         chain_height: AtomicU32::new(chain_height),
         zmq_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(false),
-        cache_path: cfg.cache_path.to_string(),
-        index_path: cfg.index_path.to_string(),
         cursor_path: cfg.cursor_path.to_string(),
     }))
 }
@@ -555,7 +553,7 @@ fn index_new_blocks(
 ///      via LRU), fall back to walking the RPC's previousblockhash
 ///      chain from `height` down. Without this fallback the previous
 ///      implementation returned `h + 1` on the first cache miss,
-///     which on a cold cache (i.e. immediately after restart) means
+///      which on a cold cache (i.e. immediately after restart) means
 ///      "fork is at the new tip" — i.e. a no-op invalidate, silently
 ///      losing the reorg.
 ///
