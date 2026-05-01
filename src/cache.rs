@@ -14,6 +14,12 @@ use crate::api::StreamFormat;
 /// Append multiple shield blocks to the cache file with a single flush.
 ///
 /// Returns a vec of (height, byte_offset, byte_length) for each block.
+///
+/// On a successful return the bytes have been written AND `sync_data`
+/// has been called — the kernel has been instructed to flush them to
+/// the storage layer. Without sync, a power loss between
+/// `cache::append_blocks` and the index save could leave the index
+/// referencing offsets that the file system never durably wrote.
 pub fn append_blocks(file: &mut File, blocks: &[ShieldBlock]) -> std::io::Result<Vec<(u32, u64, u64)>> {
     let mut current_offset = file.seek(SeekFrom::End(0))?;
     let mut entries = Vec::with_capacity(blocks.len());
@@ -25,8 +31,35 @@ pub fn append_blocks(file: &mut File, blocks: &[ShieldBlock]) -> std::io::Result
         current_offset += encoded.len() as u64;
     }
 
-    file.flush()?; // single flush for entire batch
+    // sync_data is the cheap variant of fsync — flushes the file's
+    // contents but not all metadata. For our case (append + truncate)
+    // that's exactly what we need; the file size *is* metadata and
+    // sync_data covers it on Linux.
+    file.sync_data()?;
     Ok(entries)
+}
+
+/// Truncate the cache file to a specific byte offset. Used by the
+/// reorg handler to lop off shield blocks that no longer exist on
+/// the canonical chain. After this call the file's logical EOF is
+/// at `offset`; any later `append_blocks` will write starting there.
+///
+/// **Critical**: must be called BEFORE the index is trimmed, so the
+/// caller can compute `offset` from the about-to-be-removed first
+/// orphan entry. After both the file truncate and index trim, the
+/// in-memory `shield_buffer` mirror MUST also be truncated to the
+/// same offset under the same lock — otherwise readers see torn
+/// state where the index points one place and the buffer holds
+/// stale (orphan) bytes.
+pub fn truncate_to(file: &mut File, offset: u64) -> std::io::Result<()> {
+    file.set_len(offset)?;
+    // Reset the file cursor — set_len doesn't move it, and the next
+    // append's `seek(End(0))` would be correct without this, but
+    // being explicit avoids surprises if seek-position is ever read
+    // before the next append.
+    file.seek(SeekFrom::Start(offset))?;
+    file.sync_data()?;
+    Ok(())
 }
 
 
@@ -126,6 +159,102 @@ mod tests {
 
         fs::remove_file(path).ok();
     }
+
+    /// Regression for the prod incident on bridge.pivxla.bz: 132 reorgs
+    /// over 9 days corrupted shield.bin because the reorg handler trimmed
+    /// the index but left orphan bytes in the file. Every subsequent
+    /// streaming request for a height after the fork point read the
+    /// orphan bytes too, producing duplicate-block / monotonic-order
+    /// errors at clients (MPW, agent-kit).
+    ///
+    /// This test exercises the fix end-to-end: append → truncate →
+    /// re-append, and asserts that the final file size matches exactly
+    /// what the index reports — i.e. no orphan tail.
+    #[test]
+    fn reorg_truncates_cache_no_orphan_bytes() {
+        use crate::index::ShieldIndex;
+        let path = "/tmp/pivx_bridge_test_reorg.bin";
+        let _ = fs::remove_file(path);
+
+        let mut file = open_cache(path).unwrap();
+        let mut index = ShieldIndex::new();
+
+        // Phase 1: append 3 blocks on the original chain
+        let blocks_a = vec![
+            make_block(100, 1000),
+            make_block(200, 2000),
+            make_block(300, 3000),
+        ];
+        let entries_a = append_blocks(&mut file, &blocks_a).unwrap();
+        for (h, off, _len) in &entries_a {
+            index.add(*h, *off);
+        }
+        let pre_reorg_size = fs::metadata(path).unwrap().len();
+        assert_eq!(pre_reorg_size, entries_a.iter().map(|e| e.2).sum::<u64>());
+
+        // Phase 2: simulate a reorg at height 250. Fork point = 250
+        // means heights >= 250 are orphaned. Index says block 300 lives
+        // at offset_for_height(300). Truncate the file there and trim
+        // the index to match.
+        let fork_height = 250u32;
+        let truncate_offset = index.offset_for_height(fork_height).unwrap();
+        truncate_to(&mut file, truncate_offset).unwrap();
+        index.remove_from(fork_height);
+
+        // Cache + index now agree: only blocks 100 and 200 remain.
+        assert_eq!(fs::metadata(path).unwrap().len(), truncate_offset);
+        assert_eq!(index.shield_heights, vec![100, 200]);
+
+        // Phase 3: replay forward on the new chain. New block at
+        // height 300 (different time → different bytes) must land at
+        // the truncated offset, NOT after the orphaned tail.
+        let blocks_b = vec![make_block(300, 9999)];
+        let entries_b = append_blocks(&mut file, &blocks_b).unwrap();
+        assert_eq!(entries_b.len(), 1);
+        assert_eq!(entries_b[0].0, 300);
+        assert_eq!(
+            entries_b[0].1, truncate_offset,
+            "new block must start at truncate point, not orphan tail",
+        );
+        index.add(entries_b[0].0, entries_b[0].1);
+
+        // Final invariant: file size = sum of entry lengths in the
+        // index. The pre-fix code had file_size > sum_of_entry_lengths
+        // because the orphan bytes between truncate_offset and the
+        // pre-reorg EOF stayed on disk. If that ever regresses, this
+        // assertion blows up.
+        let final_size = fs::metadata(path).unwrap().len();
+        let total_block_a_kept: u64 = entries_a.iter()
+            .filter(|e| e.0 < fork_height)
+            .map(|e| e.2)
+            .sum();
+        let total_block_b: u64 = entries_b.iter().map(|e| e.2).sum();
+        assert_eq!(
+            final_size,
+            total_block_a_kept + total_block_b,
+            "shield.bin contains orphan bytes — reorg handler regressed",
+        );
+
+        // And the new block 300's bytes are the new chain's bytes,
+        // not the original — read them back and check the height
+        // field in the footer.
+        let data = fs::read(path).unwrap();
+        let last = find_last_footer(&data).unwrap();
+        // Footer payload: [0x5d][height:4LE][time:4LE], at last - 9
+        let footer_start = last - 9;
+        let height = u32::from_le_bytes([
+            data[footer_start + 1], data[footer_start + 2],
+            data[footer_start + 3], data[footer_start + 4],
+        ]);
+        let time = u32::from_le_bytes([
+            data[footer_start + 5], data[footer_start + 6],
+            data[footer_start + 7], data[footer_start + 8],
+        ]);
+        assert_eq!(height, 300);
+        assert_eq!(time, 9999, "wrong block 300 — orphan bytes leaked through");
+
+        fs::remove_file(path).ok();
+    }
 }
 
 /// Open (or create) the shield.bin cache file.
@@ -157,6 +286,14 @@ pub fn recover_cache(path: &str) -> Option<u32> {
 
     let data = fs::read(path).ok()?;
     let last_footer_end = find_last_footer(&data)?;
+
+    // Defensive: a malformed find_last_footer return less than 9
+    // would underflow `last_footer_end - 9` below in release mode,
+    // and read random bytes for the height. Bail out instead — the
+    // file is too small to contain a real footer.
+    if last_footer_end < 9 {
+        return None;
+    }
 
     if last_footer_end < data.len() {
         eprintln!("  [recovery] Truncating shield.bin from {} to {} bytes (removing incomplete block)",

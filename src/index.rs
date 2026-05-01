@@ -42,12 +42,29 @@ impl ShieldIndex {
         Ok(Self { entries, shield_heights })
     }
 
-    /// Save to a JSON file.
+    /// Save to a JSON file. Atomic: writes to `<path>.tmp`, fsyncs,
+    /// then renames into place. Either the rename succeeds and the
+    /// file is fully on disk, or the rename fails and the previous
+    /// good file is still there. POSIX guarantees same-filesystem
+    /// rename atomicity. Without this, a process crash mid-write
+    /// leaves a partial JSON file that `load_or_create` then refuses
+    /// to parse — the bridge would start fresh and re-index from
+    /// genesis.
     pub fn save(&self, path: &str) -> Result<(), String> {
         let json = serde_json::to_string(&self.entries)
             .map_err(|e| format!("serialize index: {e}"))?;
-        fs::write(path, json)
-            .map_err(|e| format!("write index: {e}"))
+        let tmp_path = format!("{path}.tmp");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp_path)
+                .map_err(|e| format!("create tmp index: {e}"))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| format!("write tmp index: {e}"))?;
+            f.sync_data()
+                .map_err(|e| format!("sync tmp index: {e}"))?;
+        }
+        fs::rename(&tmp_path, path)
+            .map_err(|e| format!("rename tmp index: {e}"))
     }
 
     /// Add a shield block to the index.
@@ -221,5 +238,53 @@ pub fn load_or_create(path: &str) -> ShieldIndex {
     } else {
         eprintln!("  No existing index — starting fresh");
         ShieldIndex::new()
+    }
+}
+
+// ---------------------------------------------------------------------
+// Scan cursor sidecar — persists `last_scanned_height` + the hash
+// of the last block scanned. Stored separately from the index file
+// so the index format stays array-of-IndexEntry (PivxNodeController
+// compatible). Atomic save via tempfile + rename.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanCursor {
+    /// Height of the last block this bridge scanned (regardless of
+    /// whether it contained shield txs). Persisted so a restart
+    /// resumes exactly where it left off — without this the bridge
+    /// re-scans from `index.last_height() + 1`, which doesn't
+    /// account for non-shield blocks scanned between the last
+    /// shield block and the crash, leading to double-appends.
+    pub last_scanned_height: u32,
+    /// Hash of the block at `last_scanned_height`. Used by the
+    /// post-restart reorg-detection code path: if PIVX core's chain
+    /// no longer has this hash at this height, we know a reorg
+    /// happened while the bridge was down. Without this, reorgs
+    /// crossing a restart go undetected — `block_cache` is
+    /// in-memory only and starts empty.
+    pub last_scanned_hash: String,
+}
+
+impl ScanCursor {
+    pub fn load(path: &str) -> Option<Self> {
+        let data = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+    pub fn save(&self, path: &str) -> Result<(), String> {
+        let json = serde_json::to_string(self)
+            .map_err(|e| format!("serialize cursor: {e}"))?;
+        let tmp_path = format!("{path}.tmp");
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&tmp_path)
+                .map_err(|e| format!("create tmp cursor: {e}"))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| format!("write tmp cursor: {e}"))?;
+            f.sync_data()
+                .map_err(|e| format!("sync tmp cursor: {e}"))?;
+        }
+        fs::rename(&tmp_path, path)
+            .map_err(|e| format!("rename tmp cursor: {e}"))
     }
 }

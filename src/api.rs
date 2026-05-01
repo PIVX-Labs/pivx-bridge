@@ -26,6 +26,13 @@ pub struct AppState {
     pub allowed_rpcs: Vec<String>,
     /// Last chain height fully scanned (not just last shield block).
     pub last_scanned_height: RwLock<u32>,
+    /// Hash of the block at `last_scanned_height`. Persisted alongside
+    /// the cursor (in `shield_cursor.json`) so reorgs that span a
+    /// process restart are detectable: on startup, fetch the hash at
+    /// `last_scanned_height` from PIVX core and compare against this.
+    /// Without this, the in-memory `block_cache` starts empty after
+    /// every restart and the first reorg is silently missed.
+    pub last_scanned_hash: RwLock<String>,
     /// LRU cache: height → block hash. Eliminates redundant getblockhash RPCs.
     pub hash_cache: RwLock<HashCache>,
     /// Block JSON cache: `(hash, verbosity)` → stripped response.
@@ -41,6 +48,16 @@ pub struct AppState {
     /// (the classic ZMQ+poll race that produced duplicate blocks on
     /// rpc.pivxla.bz — see PIVX-Labs/pivx-bridge#1).
     pub indexing: std::sync::atomic::AtomicBool,
+    /// Path to `shield.bin` on disk. Stored on state so the reorg
+    /// handler (which needs to truncate the file) doesn't need it
+    /// threaded through every call site.
+    pub cache_path: String,
+    /// Path to `shield_index.json`.
+    pub index_path: String,
+    /// Path to the scan-cursor sidecar (`shield_cursor.json` or
+    /// `shield_cursor.testnet.json`). Saved atomically alongside the
+    /// index after every successful append + reorg.
+    pub cursor_path: String,
 }
 
 /// Fixed-size LRU cache for block height → hash mappings.

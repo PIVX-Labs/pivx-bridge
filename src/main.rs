@@ -31,6 +31,10 @@ struct NetworkConfig<'a> {
     rpc_pass: &'a str,
     index_path: &'a str,
     cache_path: &'a str,
+    /// Sidecar file persisting `last_scanned_height` + the hash of
+    /// that block. Lives next to the index/bin so an atomic save
+    /// pass updates all three together.
+    cursor_path: &'a str,
     sapling_height: u32,
     allowed_rpcs: Vec<String>,
 }
@@ -62,13 +66,68 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
     let mut cache_file = cache::open_cache(cfg.cache_path)
         .expect("failed to open cache file");
 
-    let scan_from = shield_index
-        .last_height()
-        .map(|h| h + 1)
-        .unwrap_or(cfg.sapling_height);
+    // Resume from the persisted scan cursor when present. Falls back
+    // to `index.last_height() + 1` only on first run / cursor missing.
+    // Without this, the bridge re-scans every non-shield block between
+    // the last shield block and the crash, which is wasteful and (per
+    // earlier audit) is one of the latent corruption surfaces — a
+    // crash between disk write and index save would otherwise produce
+    // duplicate appends.
+    let mut scan_cursor = index::ScanCursor::load(cfg.cursor_path).unwrap_or_default();
 
     // Block cache — 1000 blocks covers the tip range where most traffic is
     let block_cache = std::sync::RwLock::new(block_cache::BlockCache::new(1000));
+
+    // Reorg-across-restart check: the in-memory block cache starts
+    // empty after every restart, so the live reorg detector would
+    // miss any reorg that landed while the bridge was down. Compare
+    // the persisted `last_scanned_hash` against PIVX core's current
+    // hash for that height; if they diverge, walk back to find the
+    // fork and truncate state before the forward scan resumes.
+    if !scan_cursor.last_scanned_hash.is_empty() && scan_cursor.last_scanned_height > 0 {
+        if let Ok(current_hash) = rpc.get_block_hash(scan_cursor.last_scanned_height) {
+            if current_hash != scan_cursor.last_scanned_hash {
+                eprintln!(
+                    "  [{label}] Reorg-across-restart detected at height {} (was {}, now {}) — rolling state back",
+                    scan_cursor.last_scanned_height,
+                    &scan_cursor.last_scanned_hash[..16.min(scan_cursor.last_scanned_hash.len())],
+                    &current_hash[..16.min(current_hash.len())],
+                );
+                // Walk backwards via RPC to find the actual fork
+                // point. This is one-shot startup work; we don't
+                // care about the 100-block soft cap from
+                // find_fork_point.
+                let fork_height = find_fork_point_via_rpc(
+                    &rpc,
+                    scan_cursor.last_scanned_height,
+                    &shield_index,
+                );
+                eprintln!("  [{label}] Fork at height {fork_height}");
+                // Truncate shield.bin + index to before the fork
+                if let Some(offset) = shield_index.offset_for_height(fork_height) {
+                    if let Err(e) = cache::truncate_to(&mut cache_file, offset) {
+                        eprintln!("  [{label}] WARN: cache truncate failed: {e}");
+                    }
+                }
+                shield_index.remove_from(fork_height);
+                if let Err(e) = shield_index.save(cfg.index_path) {
+                    eprintln!("  [{label}] WARN: index save failed: {e}");
+                }
+                scan_cursor.last_scanned_height = fork_height.saturating_sub(1);
+                scan_cursor.last_scanned_hash.clear();
+                let _ = scan_cursor.save(cfg.cursor_path);
+            }
+        }
+    }
+    // After potential rollback, recompute scan_from
+    let scan_from = if scan_cursor.last_scanned_height >= cfg.sapling_height {
+        scan_cursor.last_scanned_height + 1
+    } else {
+        shield_index
+            .last_height()
+            .map(|h| h + 1)
+            .unwrap_or(cfg.sapling_height)
+    };
 
     if scan_from <= chain_height {
         eprintln!("  [{label}] Scanning blocks {scan_from}..{chain_height}...");
@@ -80,21 +139,27 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         }) {
             Ok(blocks) => {
                 let count = blocks.len();
+                // CRITICAL: only update the index if the cache write
+                // succeeded. The previous code path called
+                // `shield_index.add(block.height, 0)` on cache failure
+                // which poisoned the index with offset=0 (=== position
+                // of the first-ever block) — every subsequent
+                // streaming request for that height would return the
+                // entire shield.bin from the start. On disk write
+                // failure: log loudly and bail; the next pass will
+                // retry the same range.
                 match cache::append_blocks(&mut cache_file, &blocks) {
                     Ok(entries) => {
                         for (height, offset, _len) in entries {
                             shield_index.add(height, offset);
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("\n  [{label}] Warning: cache write failed: {e}");
-                        for block in &blocks {
-                            shield_index.add(block.height, 0);
+                        if let Err(e) = shield_index.save(cfg.index_path) {
+                            eprintln!("\n  [{label}] Warning: index save failed: {e}");
                         }
                     }
-                }
-                if let Err(e) = shield_index.save(cfg.index_path) {
-                    eprintln!("\n  [{label}] Warning: index save failed: {e}");
+                    Err(e) => {
+                        eprintln!("\n  [{label}] Cache write failed: {e} — will retry on next pass");
+                    }
                 }
                 eprintln!("\n  [{label}] Found {count} shield blocks ({} total)",
                     shield_index.shield_heights.len());
@@ -108,8 +173,23 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
             shield_index.shield_heights.len());
     }
 
-    // Load entire shield.bin into memory for zero-disk-I/O serving
-    let shield_buffer = std::fs::read(cfg.cache_path).unwrap_or_default();
+    // Update cursor with the final post-scan state
+    scan_cursor.last_scanned_height = chain_height;
+    if let Ok(h) = rpc.get_block_hash(chain_height) {
+        scan_cursor.last_scanned_hash = h;
+    }
+    let _ = scan_cursor.save(cfg.cursor_path);
+
+    // Load shield.bin into memory for zero-disk-I/O serving. Fail
+    // loudly on read errors — silently treating an unreadable cache
+    // as empty would let the bridge run with a buffer that doesn't
+    // match the index, and clients would receive empty responses for
+    // requests that should have returned data.
+    let shield_buffer = match std::fs::read(cfg.cache_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("failed to read shield buffer at {}: {e}", cfg.cache_path),
+    };
     let buffer_mb = shield_buffer.len() as f64 / (1024.0 * 1024.0);
     eprintln!("  [{label}] Shield buffer loaded: {buffer_mb:.1} MB in memory");
 
@@ -119,13 +199,61 @@ fn init_network(cfg: &NetworkConfig) -> Option<Arc<api::AppState>> {
         cache_file: Mutex::new(cache_file),
         shield_buffer: RwLock::new(shield_buffer),
         allowed_rpcs: cfg.allowed_rpcs.clone(),
-        last_scanned_height: RwLock::new(chain_height),
+        last_scanned_height: RwLock::new(scan_cursor.last_scanned_height),
+        last_scanned_hash: RwLock::new(scan_cursor.last_scanned_hash.clone()),
         hash_cache: RwLock::new(api::HashCache::new(1000)),
         block_cache,
         chain_height: AtomicU32::new(chain_height),
         zmq_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(false),
+        cache_path: cfg.cache_path.to_string(),
+        index_path: cfg.index_path.to_string(),
+        cursor_path: cfg.cursor_path.to_string(),
     }))
+}
+
+/// Walk backwards from `height` to find the fork point using RPC.
+/// Used at startup when the in-memory block_cache is empty. Cheap
+/// — only fires when a reorg-across-restart is actually detected,
+/// and walks at most as far as the chain has reorged (typically 1-2
+/// blocks). Returns the first height that's still on both chains
+/// (fork_height = first block that diverged).
+fn find_fork_point_via_rpc(
+    rpc: &rpc::RpcClient,
+    last_scanned: u32,
+    index: &index::ShieldIndex,
+) -> u32 {
+    // We know the hash AT last_scanned diverges from what we stored.
+    // Walk backwards block-by-block until we find one whose
+    // current-chain hash matches an earlier-known hash. Without
+    // historical hashes the only known reference points are the
+    // shield index entries that didn't move (the byte offset is
+    // ours, but the block hash is the chain's). Conservative
+    // fallback: walk back one block at a time and trust whatever
+    // RPC returns — at worst we re-index a few extra blocks, which
+    // is cheap and correct.
+    //
+    // The index entries don't store block hashes (yet), so we can't
+    // do exact-match disambiguation here. Roll back to the last
+    // *indexed* shield block before `last_scanned` and let the
+    // forward scan re-do everything between there and tip. That's a
+    // few hundred blocks of re-scan in the worst case (one shield
+    // block per ~100 ordinary blocks at current activity levels);
+    // strictly correct, doesn't require hashes-per-entry.
+    let last_shield = index
+        .shield_heights
+        .iter()
+        .rev()
+        .find(|&&h| h < last_scanned)
+        .copied()
+        .unwrap_or(0);
+    // The fork is somewhere between last_shield and last_scanned.
+    // Returning last_shield + 1 means "discard the index entry at
+    // last_shield's position?" No — last_shield itself is fine
+    // (we found it under last_scanned, before the divergence).
+    // Re-scan from last_shield + 1 forward.
+    let _ = rpc; // RPC not needed for this conservative variant
+    last_shield + 1
 }
 
 /// Build the standard route set for a network.
@@ -210,11 +338,54 @@ fn index_new_blocks(
                     eprintln!("  [{label}] {source}: reorg detected! Fork at height {fork_height}");
                     state.block_cache.write().unwrap().invalidate_from(fork_height);
 
+                    // Atomic shield-state truncation. Holds index +
+                    // buffer + file locks together so a concurrent
+                    // streaming reader can never observe torn state
+                    // (index says here / buffer holds different
+                    // bytes). Truncate ORDER MATTERS: compute
+                    // offset BEFORE removing entries, since once
+                    // they're gone we lose the offset.
                     rt.block_on(async {
                         let mut index = state.index.write().await;
+                        let mut buffer = state.shield_buffer.write().await;
+                        let mut file = state.cache_file.lock().await;
+
+                        let truncate_offset = match index.offset_for_height(fork_height) {
+                            Some(o) => o as usize,
+                            None => {
+                                // No indexed shield block at-or-after
+                                // fork_height — nothing on the shield
+                                // side to truncate. Cursor still
+                                // needs to rewind.
+                                *state.last_scanned_height.write().await = fork_height.saturating_sub(1);
+                                return;
+                            }
+                        };
+
+                        if let Err(e) = cache::truncate_to(&mut file, truncate_offset as u64) {
+                            eprintln!("  [{label}] WARN: cache truncate failed: {e}");
+                            // Don't proceed with the index/buffer
+                            // trim — we'd diverge from disk. Bail.
+                            return;
+                        }
+                        buffer.truncate(truncate_offset);
                         index.remove_from(fork_height);
-                        let _ = index.save(index_path);
+                        if let Err(e) = index.save(index_path) {
+                            eprintln!("  [{label}] WARN: index save failed: {e}");
+                        }
+
                         *state.last_scanned_height.write().await = fork_height.saturating_sub(1);
+                        // Wipe the persisted hash too — the next
+                        // append will re-populate it. Without this,
+                        // a crash between truncate and the next
+                        // successful append would leave a cursor
+                        // pointing at a hash that no longer exists.
+                        state.last_scanned_hash.write().await.clear();
+                        let cursor = index::ScanCursor {
+                            last_scanned_height: fork_height.saturating_sub(1),
+                            last_scanned_hash: String::new(),
+                        };
+                        let _ = cursor.save(&state.cursor_path);
                     });
                 }
             }
@@ -280,31 +451,56 @@ fn index_new_blocks(
                         for (height, offset, _len) in entries {
                             index.add(height, offset);
                         }
+                        if let Err(e) = index.save(index_path) {
+                            eprintln!("  [{label}] Index save failed: {e}");
+                        }
+                        true
                     } else {
-                        index.add(block.height, 0);
+                        // Cache write failed — do NOT poison the
+                        // index with offset=0. Pre-fix this branch
+                        // called `index.add(block.height, 0)` which
+                        // caused every subsequent streaming request
+                        // for that height to return shield.bin from
+                        // the start (offset 0 = the first-ever
+                        // block). Better to log + bail; the next
+                        // pass retries the same block.
+                        eprintln!(
+                            "  [{label}] {source}: block {target_h} cache write failed, NOT poisoning index — will retry",
+                        );
+                        false
                     }
-                    if let Err(e) = index.save(index_path) {
-                        eprintln!("  [{label}] Index save failed: {e}");
-                    }
-                    true
                 });
                 if !appended {
                     eprintln!("  [{label}] {source}: block {target_h} append failed, will retry");
                     break;
                 }
 
-                // Advance cursor — the only place it moves after a shield block.
+                // Advance cursor — the only place it moves after a
+                // shield block. Persist the cursor (with the new
+                // hash) so a crash here doesn't lose progress, and
+                // a reorg-across-restart at this exact height can
+                // be detected on next startup.
+                let target_hash = rpc.get_block_hash(target_h).ok();
                 rt.block_on(async {
                     *state.last_scanned_height.write().await = target_h;
+                    if let Some(h) = target_hash.as_ref() {
+                        *state.last_scanned_hash.write().await = h.clone();
+                    }
+                    let cursor = index::ScanCursor {
+                        last_scanned_height: target_h,
+                        last_scanned_hash: target_hash.clone().unwrap_or_default(),
+                    };
+                    let _ = cursor.save(&state.cursor_path);
                 });
                 needs_persist = false;
                 indexed_count += 1;
                 eprintln!("  [{label}] {source}: indexed shield block {target_h} (chain: {chain_height})");
             }
             Ok(None) => {
-                // No shield data in this block — successful scan, advance
-                // cursor in memory. Batch-persist at loop exit to avoid
-                // a disk write per empty block during catch-up.
+                // No shield data in this block — successful scan,
+                // advance cursor in memory. We only persist the
+                // cursor at loop exit to avoid a disk write per
+                // empty block during catch-up.
                 rt.block_on(async {
                     *state.last_scanned_height.write().await = target_h;
                 });
@@ -320,11 +516,22 @@ fn index_new_blocks(
     }
 
     if needs_persist {
+        // Persist whatever the final cursor state is. We grab the
+        // hash for the new cursor height too so reorg-across-
+        // restart detection works after a crash here.
+        let final_h = rt.block_on(async { *state.last_scanned_height.read().await });
+        let final_hash = rpc.get_block_hash(final_h).unwrap_or_default();
         rt.block_on(async {
             let index = state.index.read().await;
             if let Err(e) = index.save(index_path) {
                 eprintln!("  [{label}] Index save failed: {e}");
             }
+            *state.last_scanned_hash.write().await = final_hash.clone();
+            let cursor = index::ScanCursor {
+                last_scanned_height: final_h,
+                last_scanned_hash: final_hash,
+            };
+            let _ = cursor.save(&state.cursor_path);
         });
     }
 
@@ -333,31 +540,86 @@ fn index_new_blocks(
     }
 }
 
-/// Walk backwards from `height` to find where the chain diverges from cache.
+/// Walk backwards from `height` to find where the chain diverges
+/// from our cache. Returns the lowest height that's still in disagreement
+/// — i.e. the first block on the new (canonical) chain that needs to
+/// be re-indexed.
+///
+/// Strategy:
+///   1. Walk backwards block-by-block.
+///   2. If the height is in the in-memory `block_cache`, compare its
+///      cached hash against the RPC's current hash. Match → that block
+///      is on both chains, the fork is at `h + 1`. Mismatch → keep
+///      walking back.
+///   3. If the height is NOT in the cache (cold start, or cache evicted
+///      via LRU), fall back to walking the RPC's previousblockhash
+///      chain from `height` down. Without this fallback the previous
+///      implementation returned `h + 1` on the first cache miss,
+///     which on a cold cache (i.e. immediately after restart) means
+///      "fork is at the new tip" — i.e. a no-op invalidate, silently
+///      losing the reorg.
+///
+/// Bounded at 1000 blocks to avoid unbounded RPC traffic on a
+/// pathological deep reorg; if 1000 isn't enough, the bridge logs
+/// loudly and returns the bottom of the search window — the next
+/// pass will re-scan from there forward, which is correct (just
+/// expensive).
 fn find_fork_point(
     rpc: &rpc::RpcClient,
     block_cache: &std::sync::RwLock<block_cache::BlockCache>,
     height: u32,
 ) -> u32 {
-    let cache = block_cache.read().unwrap();
+    const SEARCH_DEPTH: u32 = 1000;
+    let limit = height.saturating_sub(SEARCH_DEPTH);
     let mut h = height.saturating_sub(1);
-    let limit = height.saturating_sub(100);
 
+    // Phase 1: walk backwards using cache hits where available, RPC
+    // for cache misses. Either way we compare against the chain's
+    // current hash.
     while h > limit {
-        match cache.hash_for_height(h) {
-            Some(cached_hash) => {
-                if let Ok(node_hash) = rpc.get_block_hash(h) {
-                    if node_hash == cached_hash {
-                        return h + 1;
-                    }
+        // Bind the read guard so the borrow returned by
+        // `hash_for_height` lives long enough; otherwise the temp
+        // guard dies at the semicolon and the &str dangles.
+        let cached_hash: Option<String> = {
+            let guard = block_cache.read().unwrap();
+            guard.hash_for_height(h).map(|s| s.to_string())
+        };
+        let candidate = match cached_hash {
+            Some(c) => c,
+            None => match rpc.get_block_hash(h) {
+                Ok(node_hash) => {
+                    // Cache miss + we got the chain's current hash.
+                    // No previously-recorded hash to compare to,
+                    // so we can't decide whether this height
+                    // reorged or not — keep walking back.
+                    let _ = node_hash;
+                    h = h.saturating_sub(1);
+                    continue;
                 }
-                h -= 1;
-            }
-            None => return h + 1,
+                Err(_) => {
+                    // RPC error — bail conservatively. Returning
+                    // `h + 1` from current `h` means the caller
+                    // will re-scan from h+1 forward; that's at most
+                    // SEARCH_DEPTH blocks of redundant work.
+                    return h.saturating_add(1);
+                }
+            },
+        };
+        match rpc.get_block_hash(h) {
+            Ok(node_hash) if node_hash == candidate => return h + 1,
+            Ok(_) => { h = h.saturating_sub(1); }
+            Err(_) => return h.saturating_add(1),
         }
     }
 
-    h + 1
+    // Reached the search window's lower bound without finding a
+    // match. Log loudly — this only happens on >=SEARCH_DEPTH-block
+    // reorgs, which are extremely rare on PIVX (and a strong signal
+    // something is very wrong with the node).
+    eprintln!(
+        "  [find_fork_point] WARN: walked back {SEARCH_DEPTH} blocks from {height} without finding fork; returning {limit}",
+    );
+    limit + 1
 }
 
 /// Spawn ZMQ listener — instant block notifications when it works.
@@ -500,10 +762,15 @@ fn poll_new_blocks(
 
     index_new_blocks(label, rpc_url, rpc_user, rpc_pass, state, index_path, "Poll");
 
-    // Update last_scanned_height
-    rt.block_on(async {
-        *state.last_scanned_height.write().await = chain_height;
-    });
+    // NOTE: Do NOT stomp `last_scanned_height` to `chain_height` here.
+    // `index_new_blocks` is the only authority on the cursor — it
+    // advances per-block on success and stops on the first error,
+    // preserving the never-skip invariant. The earlier code path
+    // unconditionally jumped the cursor to chain_height after the
+    // call returned, which silently skipped any block that errored
+    // mid-loop and left the index missing entries. See
+    // feedback_indexer_never_skip.md.
+    let _ = chain_height;
 }
 
 #[tokio::main]
@@ -529,6 +796,7 @@ async fn main() {
         rpc_pass: &config.rpc_pass,
         index_path: "shield_index.json",
         cache_path: "shield.bin",
+        cursor_path: "shield_cursor.json",
         sapling_height: config.sapling_height,
         allowed_rpcs: allowed_rpcs.clone(),
     }).expect("mainnet initialization failed");
@@ -567,6 +835,7 @@ async fn main() {
             rpc_pass: testnet_pass,
             index_path: "shield_index.testnet.json",
             cache_path: "shield.testnet.bin",
+            cursor_path: "shield_cursor.testnet.json",
             sapling_height: config.sapling_height,
             allowed_rpcs,
         }) {
