@@ -412,7 +412,7 @@ fn parse_sapling_descs(data: &[u8], start: usize) -> Result<Option<CompactTx>, S
 }
 
 /// Read a Bitcoin compact size (varint).
-fn read_compact_size(data: &[u8], pos: usize) -> Result<(usize, usize), String> {
+pub(crate) fn read_compact_size(data: &[u8], pos: usize) -> Result<(usize, usize), String> {
     if pos >= data.len() { return Err("read past end".into()); }
     match data[pos] {
         n if n < 253 => Ok((n as usize, 1)),

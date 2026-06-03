@@ -298,27 +298,35 @@ fn encode_compact_packet(out: &mut Vec<u8>, compact: &crate::scanner::CompactTx,
         _ => unreachable!(),
     };
 
-    let payload_len = 1 + 2 + compact.nullifiers.len() * 32 + compact.outputs.len() * output_size;
-    out.extend((payload_len as u32).to_le_bytes());
-    out.push(pkt_type);
-    out.push(compact.nullifiers.len() as u8);
-    out.push(compact.outputs.len() as u8);
+    // Build the payload first, then prefix its exact length. The spend/output
+    // counts are CompactSize varints (not single bytes), so the header size is
+    // variable — measuring the built payload keeps the length prefix correct
+    // regardless of count size. (A previous u8 count silently truncated for
+    // txs with >255 spends/outputs, corrupting the stream.)
+    let cap = 1 + 9 + 9 + compact.nullifiers.len() * 32 + compact.outputs.len() * output_size;
+    let mut payload = Vec::with_capacity(cap);
+    payload.push(pkt_type);
+    crate::stream::write_compact_size(&mut payload, compact.nullifiers.len());
+    crate::stream::write_compact_size(&mut payload, compact.outputs.len());
 
     for nf in &compact.nullifiers {
-        out.extend_from_slice(nf);
+        payload.extend_from_slice(nf);
     }
 
     for o in &compact.outputs {
         if format == StreamFormat::Compact {
-            out.extend_from_slice(&o.cv);
+            payload.extend_from_slice(&o.cv);
         }
-        out.extend_from_slice(&o.cmu);
-        out.extend_from_slice(&o.epk);
-        out.extend_from_slice(&o.enc_ciphertext);
+        payload.extend_from_slice(&o.cmu);
+        payload.extend_from_slice(&o.epk);
+        payload.extend_from_slice(&o.enc_ciphertext);
         if format == StreamFormat::Compact {
-            out.extend_from_slice(&o.out_ciphertext);
+            payload.extend_from_slice(&o.out_ciphertext);
         }
     }
+
+    out.extend((payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload);
 }
 
 // ---------------------------------------------------------------------------

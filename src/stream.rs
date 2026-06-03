@@ -27,6 +27,27 @@ const ENC_CT_SIZE: usize = 580;
 /// Size of out_ciphertext.
 const OUT_CT_SIZE: usize = 80;
 
+/// Write a length as a Bitcoin CompactSize varint — the inverse of
+/// `scanner::read_compact_size`. Values < 253 encode as a single byte, so a
+/// stream of normal-sized transactions is byte-identical to the previous `u8`
+/// encoding; only transactions with >= 253 spends or outputs differ (those
+/// previously truncated the count to a single byte and silently corrupted the
+/// stream, e.g. an 821-spend tx wrote count 53).
+pub(crate) fn write_compact_size(buf: &mut Vec<u8>, n: usize) {
+    if n < 253 {
+        buf.push(n as u8);
+    } else if n <= u16::MAX as usize {
+        buf.push(253);
+        buf.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= u32::MAX as usize {
+        buf.push(254);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        buf.push(255);
+        buf.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stream encoder
 // ---------------------------------------------------------------------------
@@ -106,8 +127,8 @@ fn encode_compact_tx(stream: &mut Vec<u8>, compact: &crate::scanner::CompactTx, 
 
     let mut payload = Vec::with_capacity(payload_len);
     payload.push(PACKET_TYPE_COMPACT_TX);
-    payload.push(compact.nullifiers.len() as u8);
-    payload.push(compact.outputs.len() as u8);
+    write_compact_size(&mut payload, compact.nullifiers.len());
+    write_compact_size(&mut payload, compact.outputs.len());
 
     for nf in &compact.nullifiers {
         payload.extend_from_slice(nf);
@@ -133,8 +154,8 @@ fn encode_compact_plus_tx(stream: &mut Vec<u8>, compact: &crate::scanner::Compac
 
     let mut payload = Vec::with_capacity(payload_len);
     payload.push(PACKET_TYPE_COMPACT_PLUS_TX);
-    payload.push(compact.nullifiers.len() as u8);
-    payload.push(compact.outputs.len() as u8);
+    write_compact_size(&mut payload, compact.nullifiers.len());
+    write_compact_size(&mut payload, compact.outputs.len());
 
     for nf in &compact.nullifiers {
         payload.extend_from_slice(nf);
@@ -354,5 +375,42 @@ mod tests {
         assert_eq!(full_output, 948);
         assert_eq!(compact_output, 756);
         assert_eq!(compact_plus_output, 644);
+    }
+
+    #[test]
+    fn write_compact_size_matches_reader() {
+        // Round-trip against the canonical decoder for the boundary values.
+        for n in [0usize, 1, 252, 253, 1000, 65535, 65536, 821] {
+            let mut buf = Vec::new();
+            write_compact_size(&mut buf, n);
+            let (decoded, _) = crate::scanner::read_compact_size(&buf, 0).unwrap();
+            assert_eq!(decoded, n, "compact size round-trip for {n}");
+        }
+        // <253 must stay a single byte (back-compat with the old u8 encoding).
+        let mut one = Vec::new();
+        write_compact_size(&mut one, 200);
+        assert_eq!(one, vec![200u8]);
+    }
+
+    #[test]
+    fn compact_tx_encodes_large_counts_as_varint() {
+        // A tx with >255 spends must NOT truncate the count (the 821-spend bug):
+        // the count is a CompactSize and decodes back to the true value.
+        let compact = CompactTx {
+            nullifiers: vec![[7u8; 32]; 300],
+            outputs: vec![],
+        };
+        let mut stream = Vec::new();
+        encode_compact_tx(&mut stream, &compact, &[]);
+
+        // [len:4][type:1][nSpends:CompactSize][nOutputs:CompactSize][nullifiers..]
+        let len = u32::from_le_bytes([stream[0], stream[1], stream[2], stream[3]]) as usize;
+        assert_eq!(stream.len(), 4 + len, "length prefix must be exact");
+        assert_eq!(stream[4], PACKET_TYPE_COMPACT_TX);
+        let (n_spends, c1) = crate::scanner::read_compact_size(&stream, 5).unwrap();
+        let (n_outputs, _) = crate::scanner::read_compact_size(&stream, 5 + c1).unwrap();
+        assert_eq!(n_spends, 300, "300 spends must round-trip (not 300 % 256 = 44)");
+        assert_eq!(n_outputs, 0);
+        assert_eq!(len, 1 + 3 + 1 + 300 * 32, "type + CompactSize(300)=3 + CompactSize(0)=1 + 300 nullifiers");
     }
 }
